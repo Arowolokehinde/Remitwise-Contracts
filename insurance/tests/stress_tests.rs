@@ -483,3 +483,41 @@ fn bench_batch_pay_premiums_50_policies() {
         cpu, mem
     );
 }
+
+#[test]
+fn stress_batch_pay_mixed_states() {
+    let env = stress_env();
+    let contract_id = env.register_contract(None, Insurance);
+    let client = InsuranceClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    let name = String::from_str(&env, "MixedBatch");
+    let coverage_type = String::from_str(&env, "health");
+    
+    let mut policy_ids = std::vec![];
+    for i in 0..50 {
+        if i % 2 == 0 {
+            // Valid policy
+            let id = client.create_policy(&owner, &name, &coverage_type, &100i128, &10_000i128, &None);
+            policy_ids.push(id);
+        } else {
+            // Invalid policy: deactivated
+            let id = client.create_policy(&owner, &name, &coverage_type, &100i128, &10_000i128, &None);
+            client.deactivate_policy(&owner, &id);
+            policy_ids.push(id);
+        }
+    }
+
+    let mut ids_vec = soroban_sdk::Vec::new(&env);
+    for &id in &policy_ids {
+        ids_vec.push_back(id);
+    }
+
+    let (cpu, mem, count) = measure(&env, || client.batch_pay_premiums(&owner, &ids_vec));
+    assert_eq!(count, 25, "Exactly 25 policies should be paid");
+
+    println!(
+        r#"{{"contract":"insurance","method":"batch_pay_premiums","scenario":"50_policies_mixed","cpu":{},"mem":{}}}"#,
+        cpu, mem
+    );
+}

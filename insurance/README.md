@@ -237,3 +237,20 @@ Insurance policies can generate corresponding bill entries for premium tracking.
 - Input validation for positive amounts
 - Policy state validation before operations
 - Access control prevents unauthorized modifications
+
+## Batch Payment Semantics
+
+The `batch_pay_premiums` function implements deterministic semantics for handling mixed states in batches of policy payments. Atomicity is strictly bounded to the explicitly successful subset of the batch.
+
+When processing payments, the contract guarantees:
+1. Every submitted policy `id` represents an atomic evaluation constraint.
+2. The entire partial success batch commits fully for valid constraints without reverting the entire transaction upon isolated subset failures.
+
+### Partial Success Reporting
+The contract emits explicit reporting events to clarify partial success atomicity. The following logic applies individually to each policy in a batch parameter list:
+
+*   **`PolicyNotFound` (Error Code 1):** If the policy ID does not exist in storage, a failure event `(symbol_short!("insure"), symbol_short!("pay_fail"))` is broadcast.
+*   **`Unauthorized` (Error Code 2):** If the policy belongs to an owner other than the caller, a failure event is broadcast.
+*   **`PolicyInactive` (Error Code 4):** If the policy exists but is not marked as active, a failure event is broadcast.
+
+Successfully paid policies will emit a `PremiumPaid` event as standard. Upon batch completion, a final `BatchPaymentResult` summarises the executed batch with `(paid_count, total_attempted, caller)`.
