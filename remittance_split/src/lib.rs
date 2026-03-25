@@ -285,7 +285,7 @@ impl RemittanceSplit {
         // Authorization logic:
         // 1. If no upgrade admin exists, only contract owner can set initial admin
         // 2. If upgrade admin exists, only current upgrade admin can transfer
-        match current_upgrade_admin {
+        match &current_upgrade_admin {
             None => {
                 // Initial admin setup - only owner can set
                 if config.owner != caller {
@@ -294,7 +294,7 @@ impl RemittanceSplit {
             }
             Some(current_admin) => {
                 // Admin transfer - only current admin can transfer
-                if current_admin != caller {
+                if *current_admin != caller {
                     return Err(RemittanceSplitError::Unauthorized);
                 }
             }
@@ -1120,7 +1120,6 @@ impl RemittanceSplit {
 }
 
 #[cfg(test)]
-<<<<<<< feature/emergency-killswitch-cooldown-safety
 mod test_inline {
     use super::*;
     use soroban_sdk::testutils::storage::Instance as _;
@@ -1679,6 +1678,4 @@ mod test_inline {
         assert_eq!(upd_topic1, SplitEvent::Updated);
     }
 }
-=======
 mod test;
->>>>>>> main
