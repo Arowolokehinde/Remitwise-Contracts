@@ -56,7 +56,7 @@ fn bench_get_total_unpaid_worst_case() {
             &false,
             &0u32,
             &None,
-            &String::from_str(&env, "XLM"),
+            &String::from_str(&env, "XLM")
         );
     }
 
