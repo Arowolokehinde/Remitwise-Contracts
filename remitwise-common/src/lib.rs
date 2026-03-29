@@ -196,6 +196,10 @@ impl RemitwiseEvents {
 // Standardized TTL Constants (Ledger Counts)
 pub const DAY_IN_LEDGERS: u32 = 17280; // ~5 seconds per ledger
 
+/// Active instance storage TTL — contracts bump when TTL drops below threshold.
+pub const INSTANCE_LIFETIME_THRESHOLD: u32 = 1 * DAY_IN_LEDGERS; // ~1 day
+pub const INSTANCE_BUMP_AMOUNT: u32 = 30 * DAY_IN_LEDGERS; // ~30 days
+
 pub const PERSISTENT_BUMP_AMOUNT: u32 = 60 * DAY_IN_LEDGERS; // 60 days
 pub const PERSISTENT_LIFETIME_THRESHOLD: u32 = 15 * DAY_IN_LEDGERS; // 15 days
 

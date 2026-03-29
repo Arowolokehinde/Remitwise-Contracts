@@ -498,24 +498,19 @@ impl ReportingContract {
         period_start: u64,
         period_end: u64,
     ) -> RemittanceSummary {
-        user.require_auth();
-        let addresses: ContractAddresses = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("ADDRS"));
-            
-        if addresses.is_none() {
-            return RemittanceSummary {
-                total_received: total_amount,
-                total_allocated: total_amount,
-                category_breakdown: Vec::new(&env),
-                period_start,
-                period_end,
-                data_availability: DataAvailability::Missing,
-            };
-        }
-        
-        let addresses = addresses.unwrap();
+        let addresses: ContractAddresses = match env.storage().instance().get(&symbol_short!("ADDRS")) {
+            Some(a) => a,
+            None => {
+                return RemittanceSummary {
+                    total_received: total_amount,
+                    total_allocated: total_amount,
+                    category_breakdown: Vec::new(&env),
+                    period_start,
+                    period_end,
+                    data_availability: DataAvailability::Missing,
+                };
+            }
+        };
 
         let split_client = RemittanceSplitClient::new(env, &addresses.remittance_split);
         let split_percentages = split_client.get_split();
@@ -543,7 +538,7 @@ impl ReportingContract {
             category_breakdown: breakdown,
             period_start,
             period_end,
-            data_availability: availability,
+            data_availability: DataAvailability::Complete,
         }
     }
 

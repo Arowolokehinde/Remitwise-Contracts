@@ -6,16 +6,18 @@ extern crate alloc;
 use remitwise_common::{
     clamp_limit, EventCategory, EventPriority, RemitwiseEvents, ARCHIVE_BUMP_AMOUNT,
     ARCHIVE_LIFETIME_THRESHOLD, CONTRACT_VERSION, INSTANCE_BUMP_AMOUNT,
-    INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_SIZE, MAX_PAGE_LIMIT,
+    INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_SIZE,
 };
 #[cfg(test)]
 use remitwise_common::MAX_PAGE_LIMIT;
-
-use alloc::vec::Vec as StdVec;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map, String,
     Symbol, Vec,
 };
+
+const SECONDS_PER_DAY: u64 = 86400;
+/// Upper bound for recurring bill frequency (sanity cap).
+const MAX_FREQUENCY_DAYS: u32 = 3650;
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -1170,7 +1172,6 @@ impl BillPayments {
             name: archived_bill.name.clone(),
             external_ref: archived_bill.external_ref.clone(),
             amount: archived_bill.amount,
-            external_ref: None,
             due_date: env.ledger().timestamp() + 2592000,
             recurring: false,
             frequency_days: 0,
