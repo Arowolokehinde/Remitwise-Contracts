@@ -7,8 +7,6 @@ use soroban_sdk::{
 use remitwise_common::{EventCategory, EventPriority, RemitwiseEvents};
 
 // Event topics
-const GOAL_CREATED: Symbol = symbol_short!("created");
-const FUNDS_ADDED: Symbol = symbol_short!("added");
 const GOAL_COMPLETED: Symbol = symbol_short!("completed");
 
 #[derive(Clone)]
@@ -428,8 +426,6 @@ impl SavingsGoalContract {
                     panic!("Unauthorized: only current upgrade admin can transfer");
                 }
             }
-        } else if caller != new_admin {
-            panic!("Unauthorized: bootstrap requires caller == new_admin");
         }
 
         env.storage()
@@ -623,7 +619,6 @@ impl SavingsGoalContract {
     ///   goals should validate this before invoking the contract.
     ///
     /// # Events
-    /// - Emits `GOAL_CREATED` with goal details.
     /// - Emits `SavingsEvent::GoalCreated`.
     pub fn create_goal(
         env: Env,
