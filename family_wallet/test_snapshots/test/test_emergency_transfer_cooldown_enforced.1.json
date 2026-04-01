@@ -459,6 +459,18 @@
                                   },
                                   {
                                     "key": {
+                                      "symbol": "precision_limit"
+                                    },
+                                    "val": {
+                                      "vec": [
+                                        {
+                                          "symbol": "None"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  {
+                                    "key": {
                                       "symbol": "role"
                                     },
                                     "val": {

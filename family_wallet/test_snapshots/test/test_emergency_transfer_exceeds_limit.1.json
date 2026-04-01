@@ -332,6 +332,18 @@
                                   },
                                   {
                                     "key": {
+                                      "symbol": "precision_limit"
+                                    },
+                                    "val": {
+                                      "vec": [
+                                        {
+                                          "symbol": "None"
+                                        }
+                                      ]
+                                    }
+                                  },
+                                  {
+                                    "key": {
                                       "symbol": "role"
                                     },
                                     "val": {
@@ -1395,7 +1407,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'Emergency amount exceeds maximum allowed' from contract function 'Symbol(obj#345)'"
+                  "string": "caught panic 'Emergency amount exceeds maximum allowed' from contract function 'Symbol(obj#357)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"

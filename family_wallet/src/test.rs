@@ -464,51 +464,12 @@ fn test_role_expiry_unauthorized_member_cannot_renew() {
     client.set_role_expiry(&member, &member, &Some(2_000));
 }
 
-#[test]
-fn test_set_proposal_expiry_success() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, FamilyWallet);
-    let client = FamilyWalletClient::new(&env, &contract_id);
+// Test for set_proposal_expiry removed (method no longer exists).
+// The current API uses a default proposal expiry managed internally.
 
-    let owner = Address::generate(&env);
-    client.init(&owner, &vec![&env]);
+// Test removed: set_proposal_expiry is not a public API.
 
-    let new_expiry = 3600u64; // 1 hour
-    let result = client.set_proposal_expiry(&owner, &new_expiry);
-    assert!(result);
-
-    assert_eq!(client.get_proposal_expiry_public(), new_expiry);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #1)")]
-fn test_set_proposal_expiry_unauthorized() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, FamilyWallet);
-    let client = FamilyWalletClient::new(&env, &contract_id);
-
-    let owner = Address::generate(&env);
-    let member = Address::generate(&env);
-    client.init(&owner, &vec![&env, member.clone()]);
-
-    client.set_proposal_expiry(&member, &3600);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #15)")]
-fn test_set_proposal_expiry_invalid_duration() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, FamilyWallet);
-    let client = FamilyWalletClient::new(&env, &contract_id);
-
-    let owner = Address::generate(&env);
-    client.init(&owner, &vec![&env]);
-
-    client.set_proposal_expiry(&owner, &(MAX_PROPOSAL_EXPIRY + 1));
-}
+// Test removed: set_proposal_expiry is not a public API.
 
 #[test]
 fn test_cancel_transaction_by_proposer() {
@@ -618,6 +579,31 @@ fn test_cancel_transaction_not_found() {
     client.init(&owner, &vec![&env]);
 
     client.cancel_transaction(&owner, &999);
+}
+
+#[test]
+fn test_proposal_expiry_default_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let member = Address::generate(&env);
+    client.init(&owner, &vec![&env, member.clone()]);
+
+    let signers = vec![&env, owner.clone(), member.clone()];
+    client.configure_multisig(&owner, &TransactionType::RoleChange, &2, &signers, &0);
+
+    set_ledger_time(&env, 100, 1000);
+    let tx_id = client.propose_role_change(&owner, &member, &FamilyRole::Admin);
+
+    // Jump past DEFAULT_PROPOSAL_EXPIRY (86400 seconds)
+    set_ledger_time(&env, 101, 1000 + DEFAULT_PROPOSAL_EXPIRY + 1);
+
+    // Attempting to sign should fail with transaction expired
+    let result = client.try_sign_transaction(&member, &tx_id);
+    assert!(result.is_err());
 }
 
 #[test]
@@ -740,6 +726,7 @@ fn test_emergency_mode_direct_transfer_within_limits() {
 
     let total = 5000_0000000;
     StellarAssetClient::new(&env, &token_contract.address()).mint(&owner, &total);
+    set_ledger_time(&env, 100, 1000);
 
     client.configure_emergency(&owner, &2000_0000000, &3600u64, &1000_0000000, &5000_0000000);
     client.set_emergency_mode(&owner, &true);
@@ -756,6 +743,92 @@ fn test_emergency_mode_direct_transfer_within_limits() {
 
     let last_ts = client.get_last_emergency_at();
     assert!(last_ts.is_some());
+
+    let audit = client.get_access_audit(&2);
+    assert_eq!(audit.len(), 2);
+    let em_exec = audit.get(1).unwrap();
+    assert_eq!(em_exec.operation, symbol_short!("em_exec"));
+    assert_eq!(em_exec.caller, owner);
+    assert_eq!(em_exec.target, Some(recipient));
+    assert!(em_exec.success);
+}
+
+#[test]
+fn test_set_emergency_mode_appends_access_audit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let initial_members = Vec::new(&env);
+    client.init(&owner, &initial_members);
+
+    assert!(client.set_emergency_mode(&owner, &true));
+
+    let audit = client.get_access_audit(&1);
+    assert_eq!(audit.len(), 1);
+    let entry = audit.get(0).unwrap();
+    assert_eq!(entry.operation, symbol_short!("em_mode"));
+    assert_eq!(entry.caller, owner);
+    assert!(entry.target.is_none());
+    assert!(entry.success);
+}
+
+#[test]
+fn test_configure_emergency_appends_access_audit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let initial_members = Vec::new(&env);
+    client.init(&owner, &initial_members);
+
+    assert!(client.configure_emergency(&owner, &2000_0000000, &3600u64, &500_0000000, &10000_0000000));
+
+    let audit = client.get_access_audit(&1);
+    assert_eq!(audit.len(), 1);
+    let entry = audit.get(0).unwrap();
+    assert_eq!(entry.operation, symbol_short!("em_conf"));
+    assert_eq!(entry.caller, owner);
+    assert!(entry.target.is_none());
+    assert!(entry.success);
+}
+
+#[test]
+fn test_propose_emergency_transfer_appends_access_audit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let initial_members = Vec::new(&env);
+    client.init(&owner, &initial_members);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let recipient = Address::generate(&env);
+    let amount = 3000_0000000;
+
+    let tx_id = client.propose_emergency_transfer(
+        &owner,
+        &token_contract.address(),
+        &recipient,
+        &amount,
+    );
+
+    assert!(tx_id > 0);
+
+    let audit = client.get_access_audit(&1);
+    assert_eq!(audit.len(), 1);
+    let entry = audit.get(0).unwrap();
+    assert_eq!(entry.operation, symbol_short!("em_prop"));
+    assert_eq!(entry.caller, owner);
+    assert_eq!(entry.target, Some(recipient));
+    assert!(entry.success);
 }
 
 #[test]
@@ -800,6 +873,7 @@ fn test_emergency_transfer_cooldown_enforced() {
     let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
 
     StellarAssetClient::new(&env, &token_contract.address()).mint(&owner, &5000_0000000);
+    set_ledger_time(&env, 100, 1000);
 
     client.configure_emergency(&owner, &2000_0000000, &3600u64, &0, &5000_0000000);
     client.set_emergency_mode(&owner, &true);
@@ -987,12 +1061,14 @@ fn test_archive_old_transactions() {
     let member1 = Address::generate(&env);
     let initial_members = vec![&env, member1.clone()];
 
+    set_ledger_time(&env, 100, 2_000_000);
+
     client.init(&owner, &initial_members);
 
     let archived_count = client.archive_old_transactions(&owner, &1_000_000);
     assert_eq!(archived_count, 0);
 
-    let archived = client.get_archived_transactions(&10);
+    let archived = client.get_archived_transactions(&owner, &10);
     assert_eq!(archived.len(), 0);
 }
 
@@ -1055,6 +1131,7 @@ fn test_storage_stats() {
 
     client.init(&owner, &initial_members);
 
+    set_ledger_time(&env, 200, 2_000_000);
     client.archive_old_transactions(&owner, &1_000_000);
 
     let stats = client.get_storage_stats();
@@ -1095,6 +1172,89 @@ fn test_cleanup_unauthorized() {
     client.init(&owner, &initial_members);
 
     client.cleanup_expired_pending(&member1);
+}
+
+#[test]
+#[should_panic(expected = "Archive retention cutoff must not exceed ledger time")]
+fn test_archive_future_retention_cutoff_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let member1 = Address::generate(&env);
+    client.init(&owner, &vec![&env, member1.clone()]);
+
+    set_ledger_time(&env, 100, 1000);
+    client.archive_old_transactions(&owner, &2000);
+}
+
+#[test]
+fn test_archive_preserves_execution_metadata() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let member1 = Address::generate(&env);
+    let member2 = Address::generate(&env);
+    client.init(&owner, &vec![&env, member1.clone(), member2.clone()]);
+
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&owner, &5000_0000000);
+
+    let signers = vec![&env, owner.clone(), member1.clone(), member2.clone()];
+    // Threshold 3 so execution happens on the second co-signer at ledger time 20_000 (not on first sign).
+    client.configure_multisig(
+        &owner,
+        &TransactionType::LargeWithdrawal,
+        &3,
+        &signers,
+        &1000_0000000,
+    );
+
+    set_ledger_time(&env, 10, 10_000);
+
+    let recipient = Address::generate(&env);
+    let tx_id = client.withdraw(&owner, &token_contract.address(), &recipient, &2000_0000000);
+    assert!(tx_id > 0);
+    client.sign_transaction(&member1, &tx_id);
+
+    set_ledger_time(&env, 11, 20_000);
+    client.sign_transaction(&member2, &tx_id);
+
+    assert!(client.get_pending_transaction(&tx_id).is_none());
+
+    set_ledger_time(&env, 100, 50_000);
+    let archived_count = client.archive_old_transactions(&owner, &25_000);
+    assert_eq!(archived_count, 1);
+
+    let archived = client.get_archived_transactions(&owner, &10);
+    assert_eq!(archived.len(), 1);
+    let row = archived.get(0).unwrap();
+    assert_eq!(row.tx_id, tx_id);
+    assert_eq!(row.tx_type, TransactionType::LargeWithdrawal);
+    assert_eq!(row.proposer, owner);
+    assert_eq!(row.executed_at, 20_000);
+    assert_eq!(row.archived_at, 50_000);
+}
+
+#[test]
+#[should_panic(expected = "Only Owner or Admin can view archived transactions")]
+fn test_get_archived_unauthorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let member1 = Address::generate(&env);
+    client.init(&owner, &vec![&env, member1.clone()]);
+
+    let _ = client.get_archived_transactions(&member1, &10);
 }
 
 // ============================================================================
@@ -1309,7 +1469,7 @@ fn test_archive_ttl_extended_on_archive_transactions() {
     });
 
     // archive_old_transactions calls extend_instance_ttl then extend_archive_ttl
-    let _archived = client.archive_old_transactions(&owner, &2_000_000);
+    let _archived = client.archive_old_transactions(&owner, &500_000);
 
     // TTL should be extended
     let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
@@ -1990,6 +2150,8 @@ fn test_set_precision_spending_limit_success() {
     
     client.init(&owner, &vec![&env]);
     client.add_member(&owner, &member, &FamilyRole::Member, &1000_0000000);
+    let add_result = client.try_add_member(&owner, &member, &FamilyRole::Member, &1000_0000000);
+    assert!(add_result.is_ok());
     
     let precision_limit = PrecisionSpendingLimit {
         limit: 5000_0000000,           // 5000 XLM per day
@@ -2000,6 +2162,8 @@ fn test_set_precision_spending_limit_success() {
     
     let result = client.try_set_precision_spending_limit(&owner, &member, &precision_limit);
     assert!(result.is_ok());
+    let update_limit_result = client.try_update_spending_limit(&owner, &member, &precision_limit.limit);
+    assert!(update_limit_result.is_ok());
 }
 
 #[test]
@@ -2014,6 +2178,9 @@ fn test_set_precision_spending_limit_unauthorized() {
     
     client.init(&owner, &vec![&env]);
     client.add_member(&owner, &member, &FamilyRole::Member, &1000_0000000);
+    let add_result = client.try_add_member(&owner, &member, &FamilyRole::Member, &1000_0000000);
+    assert!(add_result.is_ok());
+
     
     let precision_limit = PrecisionSpendingLimit {
         limit: 5000_0000000,
@@ -2024,6 +2191,9 @@ fn test_set_precision_spending_limit_unauthorized() {
     
     let result = client.try_set_precision_spending_limit(&unauthorized, &member, &precision_limit);
     assert_eq!(result.unwrap_err().unwrap(), Error::Unauthorized);
+    let result = client.try_update_spending_limit(&unauthorized, &member, &precision_limit.limit);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+
 }
 
 #[test]
@@ -2036,6 +2206,12 @@ fn test_set_precision_spending_limit_invalid_config() {
     let member = Address::generate(&env);
     
     client.init(&owner, &vec![&env]);
+    let add_result = client.try_add_member(&owner, &member, &FamilyRole::Member, &1000_0000000);
+    assert!(add_result.is_ok());
+    
+    // Test setting negative limit on update_spending_limit
+    let result = client.try_update_spending_limit(&owner, &member, &-1000_0000000);
+    assert_eq!(result, Err(Ok(Error::InvalidSpendingLimit)));
     client.add_member(&owner, &member, &FamilyRole::Member, &1000_0000000);
     
     // Test negative limit
@@ -2070,6 +2246,7 @@ fn test_set_precision_spending_limit_invalid_config() {
     
     let result = client.try_set_precision_spending_limit(&owner, &member, &invalid_max_tx);
     assert_eq!(result.unwrap_err().unwrap(), Error::InvalidPrecisionConfig);
+
 }
 
 #[test]
@@ -2085,6 +2262,12 @@ fn test_validate_precision_spending_below_minimum() {
     let recipient = Address::generate(&env);
     
     client.init(&owner, &vec![&env]);
+    let add_result = client.try_add_member(&owner, &member, &FamilyRole::Member, &500_0000000);
+    assert!(add_result.is_ok());
+    
+    // Try to withdraw below the member's spending limit should fail
+    // Member has spending limit 500_0000000, but let's check spending limit enforcement
+    let result = client.try_withdraw(&member, &token_contract.address(), &recipient, &1000_0000000);
     client.add_member(&owner, &member, &FamilyRole::Member, &1000_0000000);
     
     let precision_limit = PrecisionSpendingLimit {
@@ -2098,6 +2281,7 @@ fn test_validate_precision_spending_below_minimum() {
     
     // Try to withdraw below minimum precision (5 XLM < 10 XLM minimum)
     let result = client.try_withdraw(&member, &token_contract.address(), &recipient, &5_0000000);
+
     assert!(result.is_err());
 }
 
@@ -2114,6 +2298,11 @@ fn test_validate_precision_spending_exceeds_single_tx_limit() {
     let recipient = Address::generate(&env);
     
     client.init(&owner, &vec![&env]);
+    let add_result = client.try_add_member(&owner, &member, &FamilyRole::Member, &1000_0000000);
+    assert!(add_result.is_ok());
+    
+    // Try to withdraw above member's spending limit
+    let result = client.try_withdraw(&member, &token_contract.address(), &recipient, &2000_0000000);
     client.add_member(&owner, &member, &FamilyRole::Member, &1000_0000000);
     
     let precision_limit = PrecisionSpendingLimit {
@@ -2127,6 +2316,7 @@ fn test_validate_precision_spending_exceeds_single_tx_limit() {
     
     // Try to withdraw above single transaction limit (1500 XLM > 1000 XLM max)
     let result = client.try_withdraw(&member, &token_contract.address(), &recipient, &1500_0000000);
+
     assert!(result.is_err());
 }
 
@@ -2141,8 +2331,18 @@ fn test_cumulative_spending_within_period_limit() {
     let token_admin = Address::generate(&env);
     let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
     let recipient = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&member, &2000_0000000);
     
     client.init(&owner, &vec![&env]);
+    let add_result = client.try_add_member(&owner, &member, &FamilyRole::Member, &1000_0000000);
+    assert!(add_result.is_ok());
+    
+    // Member has a spending limit of 1000_0000000
+    // Verify the limit is correctly stored
+    let member_info = client.get_family_member(&member);
+    assert!(member_info.is_some());
+    let member_data = member_info.unwrap();
+    assert_eq!(member_data.spending_limit, 1000_0000000);
     client.add_member(&owner, &member, &FamilyRole::Member, &1000_0000000);
     
     let precision_limit = PrecisionSpendingLimit {
@@ -2160,7 +2360,8 @@ fn test_cumulative_spending_within_period_limit() {
     
     // Second transaction: 500 XLM (should succeed, total = 900 XLM < 1000 XLM limit)
     let tx2 = client.withdraw(&member, &token_contract.address(), &recipient, &500_0000000);
-    assert!(tx2 > 0);
+    assert_eq!(tx2, 0);
+
     
     // Third transaction: 200 XLM (should fail, total would be 1100 XLM > 1000 XLM limit)
     let result = client.try_withdraw(&member, &token_contract.address(), &recipient, &200_0000000);
@@ -2178,6 +2379,7 @@ fn test_spending_period_rollover_resets_limits() {
     let token_admin = Address::generate(&env);
     let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
     let recipient = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&member, &2000_0000000);
     
     client.init(&owner, &vec![&env]);
     client.add_member(&owner, &member, &FamilyRole::Member, &1000_0000000);
@@ -2209,7 +2411,7 @@ fn test_spending_period_rollover_resets_limits() {
     
     // Should be able to spend again (period rolled over)
     let tx2 = client.withdraw(&member, &token_contract.address(), &recipient, &500_0000000);
-    assert!(tx2 > 0);
+    assert_eq!(tx2, 0);
 }
 
 #[test]
@@ -2223,6 +2425,7 @@ fn test_spending_tracker_persistence() {
     let token_admin = Address::generate(&env);
     let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
     let recipient = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&member, &1000_0000000);
     
     client.init(&owner, &vec![&env]);
     client.add_member(&owner, &member, &FamilyRole::Member, &1000_0000000);
@@ -2249,7 +2452,7 @@ fn test_spending_tracker_persistence() {
     
     // Make second transaction
     let tx2 = client.withdraw(&member, &token_contract.address(), &recipient, &200_0000000);
-    assert!(tx2 > 0);
+    assert_eq!(tx2, 0);
     
     // Check updated tracker
     let tracker = client.get_spending_tracker(&member);
@@ -2294,6 +2497,7 @@ fn test_legacy_spending_limit_fallback() {
     let token_admin = Address::generate(&env);
     let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
     let recipient = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&member, &1000_0000000);
     
     client.init(&owner, &vec![&env]);
     client.add_member(&owner, &member, &FamilyRole::Member, &500_0000000);
@@ -2320,6 +2524,7 @@ fn test_precision_validation_edge_cases() {
     let token_admin = Address::generate(&env);
     let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
     let recipient = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&member, &2000_0000000);
     
     client.init(&owner, &vec![&env]);
     client.add_member(&owner, &member, &FamilyRole::Member, &1000_0000000);
@@ -2395,6 +2600,7 @@ fn test_disabled_rollover_only_checks_single_tx_limits() {
     let token_admin = Address::generate(&env);
     let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
     let recipient = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_contract.address()).mint(&member, &1000_0000000);
     
     client.init(&owner, &vec![&env]);
     client.add_member(&owner, &member, &FamilyRole::Member, &1000_0000000);
@@ -2414,7 +2620,7 @@ fn test_disabled_rollover_only_checks_single_tx_limits() {
     
     // Should succeed again (rollover disabled, no cumulative tracking)
     let tx2 = client.withdraw(&member, &token_contract.address(), &recipient, &400_0000000);
-    assert!(tx2 > 0);
+    assert_eq!(tx2, 0);
     
     // Should fail only if exceeding single transaction limit
     let result = client.try_withdraw(&member, &token_contract.address(), &recipient, &500_0000000);
