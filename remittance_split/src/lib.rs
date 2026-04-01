@@ -7,7 +7,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token::TokenClient, vec,
     Address, BytesN, Env, IntoVal, Map, Symbol, Vec,
 };
-use remitwise_common::{EventCategory, EventPriority, RemitwiseEvents};
+use remitwise_common::{clamp_limit, EventCategory, EventPriority, RemitwiseEvents};
 
 // Event topics
 const SPLIT_INITIALIZED: Symbol = symbol_short!("init");
@@ -47,14 +47,25 @@ pub enum RemittanceSplitError {
 
     RequestHashMismatch = 15,
 
+    PercentagesDoNotSumTo100 = 18,
+    FutureTimestamp = 19,
+    OwnerMismatch = 20,
     NonceAlreadyUsed = 16,
+    PercentageOutOfRange = 17,
 }
 
-#[derive(Clone)]
 #[contracttype]
-pub struct Allocation {
-    pub category: Symbol,
-    pub amount: i128,
+pub struct SplitAuthPayload {
+    pub domain_id: Symbol,
+    pub network_id: BytesN<32>,
+    pub contract_addr: Address,
+    pub owner_addr: Address,
+    pub nonce_val: u64,
+    pub usdc_contract: Address,
+    pub spending_percent: u32,
+    pub savings_percent: u32,
+    pub bills_percent: u32,
+    pub insurance_percent: u32,
 }
 
 #[derive(Clone)]
@@ -64,6 +75,21 @@ pub struct AccountGroup {
     pub savings: Address,
     pub bills: Address,
     pub insurance: Address,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct SplitAuthPayload {
+    pub domain_id: Symbol,
+    pub network_id: BytesN<32>,
+    pub contract_addr: Address,
+    pub owner_addr: Address,
+    pub nonce_val: u64,
+    pub usdc_contract: Address,
+    pub spending_percent: u32,
+    pub savings_percent: u32,
+    pub bills_percent: u32,
+    pub insurance_percent: u32,
 }
 
 // Storage TTL constants
@@ -138,6 +164,7 @@ pub struct ExportSnapshot {
     pub checksum: u64,
     pub config: SplitConfig,
     pub schedules: Vec<RemittanceSchedule>,
+    pub exported_at: u64,
 }
 
 /// Audit log entry for security and compliance.
@@ -195,7 +222,43 @@ pub enum ScheduleEvent {
 /// Current snapshot schema version. Bumped to 2 for FNV-1a checksum + exported_at field.
 const SCHEMA_VERSION: u32 = 2;
 /// Oldest snapshot schema version this contract can import. Enables backward compat.
-const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 2;
+const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
+
+/// Domain-separated payload for split initialization.
+/// Binds technical context (network, contract) with business parameters
+/// to prevent relay/replay attacks across different deployments or networks.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SplitAuthPayload {
+    /// Domain identifier for functional separation (e.g. symbol_short!("init"))
+    pub domain_id: Symbol,
+    /// Network ID to prevent replay across different Stellar networks
+    pub network_id: BytesN<32>,
+    /// Contract address to prevent replay across different contract instances
+    pub contract_addr: Address,
+    /// Owner address who is authorizing the initialization
+    pub owner_addr: Address,
+    /// Per-address nonce for sequential replay protection
+    pub nonce_val: u64,
+    /// USDC token contract address
+    pub usdc_contract: Address,
+    /// Percentage for precision spending
+    pub spending_percent: u32,
+    /// Percentage for savings goals
+    pub savings_percent: u32,
+    /// Percentage for bill payments
+    pub bills_percent: u32,
+    /// Percentage for insurance premiums
+    pub insurance_percent: u32,
+}
+
+fn clamp_limit(limit: u32) -> u32 {
+    if limit == 0 || limit > MAX_PAGE_LIMIT {
+        MAX_PAGE_LIMIT
+    } else {
+        limit
+    }
+}
 const MAX_AUDIT_ENTRIES: u32 = 100;
 const DEFAULT_PAGE_LIMIT: u32 = 20;
 const MAX_PAGE_LIMIT: u32 = 50;
@@ -449,11 +512,11 @@ impl RemittanceSplit {
     /// their sum equals exactly 100.
     ///
     /// Enforced invariants (checked in order):
-    /// 1. Each bucket must be <= 100 (`PercentageOutOfRange`).
+    /// 1. Each bucket must be <= 100 (`InvalidPercentages`).
     /// 2. The four buckets must sum to exactly 100 (`PercentagesDoNotSumTo100`).
     ///
     /// Separating the two checks gives callers a precise error code:
-    /// a value like 110/0/0/0 produces `PercentageOutOfRange`, not a misleading
+    /// a value like 110/0/0/0 produces `InvalidPercentages`, not a misleading
     /// "doesn't sum to 100" message.
     fn validate_percentages(
         spending_percent: u32,
@@ -467,12 +530,12 @@ impl RemittanceSplit {
             || bills_percent > 100
             || insurance_percent > 100
         {
-            return Err(RemittanceSplitError::PercentageOutOfRange);
+            return Err(RemittanceSplitError::InvalidPercentages);
         }
         // Global sum invariant.
         let total = spending_percent + savings_percent + bills_percent + insurance_percent;
         if total != 100 {
-            return Err(RemittanceSplitError::PercentagesDoNotSumTo100);
+            return Err(RemittanceSplitError::InvalidPercentages);
         }
         Ok(())
     }
@@ -905,6 +968,7 @@ impl RemittanceSplit {
             checksum,
             config,
             schedules,
+            exported_at: env.ledger().timestamp(),
         }))
     }
 
@@ -949,7 +1013,7 @@ impl RemittanceSplit {
         //    incomplete and must not be restored.
         if !snapshot.config.initialized {
             Self::append_audit(&env, symbol_short!("import"), &caller, false);
-            return Err(RemittanceSplitError::SnapshotNotInitialized);
+            return Err(RemittanceSplitError::NotInitialized);
         }
 
         // 4. Per-field percentage range — reject values that could not have
@@ -960,7 +1024,7 @@ impl RemittanceSplit {
             || snapshot.config.insurance_percent > 100
         {
             Self::append_audit(&env, symbol_short!("import"), &caller, false);
-            return Err(RemittanceSplitError::InvalidPercentageRange);
+            return Err(RemittanceSplitError::InvalidPercentages);
         }
 
         // 5. Sum constraint
@@ -1077,7 +1141,7 @@ impl RemittanceSplit {
 
         // 3. Initialized flag
         if !snapshot.config.initialized {
-            return Err(RemittanceSplitError::SnapshotNotInitialized);
+            return Err(RemittanceSplitError::NotInitialized);
         }
 
         // 4. Per-field range
@@ -1086,7 +1150,7 @@ impl RemittanceSplit {
             || snapshot.config.bills_percent > 100
             || snapshot.config.insurance_percent > 100
         {
-            return Err(RemittanceSplitError::InvalidPercentageRange);
+            return Err(RemittanceSplitError::InvalidPercentages);
         }
 
         // 5. Sum constraint
@@ -1465,18 +1529,22 @@ impl RemittanceSplit {
             return Err(RemittanceSplitError::InvalidDueDate);
         }
 
-        let next_schedule_id = env
+        let current_max_id = env
             .storage()
             .instance()
             .get(&symbol_short!("NEXT_RSCH"))
             .unwrap_or(0u32);
-            
+
         let next_schedule_id = current_max_id
             .checked_add(1)
             .ok_or(RemittanceSplitError::Overflow)?;
 
         // Explicit uniqueness check to prevent any potential storage collisions
-        if schedules.contains_key(next_schedule_id) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Schedule(next_schedule_id))
+        {
             return Err(RemittanceSplitError::Overflow); // Should be unreachable with monotonic counter
         }
 
@@ -1682,4 +1750,3 @@ impl RemittanceSplit {
         env.storage().persistent().get(&DataKey::Schedule(schedule_id))
     }
 }
-
