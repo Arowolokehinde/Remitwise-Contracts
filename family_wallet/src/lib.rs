@@ -1,8 +1,8 @@
 #![no_std]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token::TokenClient, Address,
-    Env, Map, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short,
+    token::TokenClient, Address, Env, Map, Symbol, Vec,
 };
 
 use remitwise_common::{FamilyRole, EventCategory, EventPriority, RemitwiseEvents};
@@ -68,8 +68,6 @@ pub struct FamilyMember {
     pub role: FamilyRole,
     /// Legacy per-transaction cap in stroops. 0 = unlimited.
     pub spending_limit: i128,
-    /// Enhanced precision spending limit (optional)
-    pub precision_limit: Option<PrecisionSpendingLimit>,
     pub added_at: u64,
 }
 
@@ -236,6 +234,7 @@ pub enum Error {
     SignerNotMember = 17,
     DuplicateSigner = 18,
     TooManySigners = 19,
+    InvalidPrecisionConfig = 20,
 }
 
 #[contractimpl]
@@ -375,7 +374,6 @@ impl FamilyWallet {
                 address: member_address.clone(),
                 role,
                 spending_limit,
-                precision_limit: None, // Default to legacy behavior
                 added_at: now,
             },
         );
@@ -1010,7 +1008,6 @@ impl FamilyWallet {
                 address: member.clone(),
                 role,
                 spending_limit: 0,
-                precision_limit: None, // Default to legacy behavior
                 added_at: timestamp,
             },
         );
@@ -1120,16 +1117,9 @@ impl FamilyWallet {
     }
 
     pub fn get_last_emergency_at(env: Env) -> Option<u64> {
-        let ts: u64 = env
-            .storage()
+        env.storage()
             .instance()
             .get(&symbol_short!("EM_LAST"))
-            .unwrap_or(0u64);
-        if ts == 0 {
-            None
-        } else {
-            Some(ts)
-        }
     }
 
     pub fn archive_old_transactions(env: Env, caller: Address, before_timestamp: u64) -> u32 {
@@ -1484,7 +1474,6 @@ impl FamilyWallet {
                     address: item.address.clone(),
                     role: item.role,
                     spending_limit: 0,
-                    precision_limit: None, // Default to legacy behavior
                     added_at: timestamp,
                 },
             );
@@ -1587,13 +1576,15 @@ impl FamilyWallet {
         }
 
         let now = env.ledger().timestamp();
-        let last_ts: u64 = env
+        let last_ts_opt: Option<u64> = env
             .storage()
             .instance()
-            .get(&symbol_short!("EM_LAST"))
-            .unwrap_or(0u64);
-        if last_ts != 0 && now < last_ts.saturating_add(config.cooldown) {
-            panic!("Emergency transfer cooldown period not elapsed");
+            .get(&symbol_short!("EM_LAST"));
+        
+        if let Some(last_ts) = last_ts_opt {
+            if now < last_ts.saturating_add(config.cooldown) {
+                panic!("Emergency transfer cooldown period not elapsed");
+            }
         }
 
         // Daily Rate Limit Enforcement
@@ -1614,7 +1605,7 @@ impl FamilyWallet {
 
         let token_client = TokenClient::new(&env, &token);
         let current_balance = token_client.balance(&proposer);
-        if current_balance - amount < config.min_balance {
+        if current_balance < amount || current_balance - amount < config.min_balance {
             panic!("Emergency transfer would violate minimum balance requirement");
         }
 
@@ -1906,6 +1897,236 @@ impl FamilyWallet {
         env.storage()
             .instance()
             .set(&symbol_short!("STOR_STAT"), &stats);
+    }
+
+    /// Validate precision spending limit for a member.
+    fn validate_precision_spending(env: Env, caller: Address, amount: i128) -> Result<(), Error> {
+        let member: FamilyMember = match env
+            .storage()
+            .instance()
+            .get(&symbol_short!("MEMBERS"))
+            .and_then(|members: Map<Address, FamilyMember>| members.get(caller.clone()))
+        {
+            Some(m) => m,
+            None => return Ok(()), // Unknown member, skip validation
+        };
+
+        // Only Members with configured precision limits are restricted
+        if member.role == FamilyRole::Owner || member.role == FamilyRole::Admin {
+            return Ok(());
+        }
+
+        let precision_limits: Map<Address, PrecisionSpendingLimit> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("PREC_LIM"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        // Legacy spending limit check (field in FamilyMember)
+        if member.spending_limit > 0 && amount > member.spending_limit {
+            return Err(Error::InvalidSpendingLimit);
+        }
+
+        if let Some(precision) = precision_limits.get(caller.clone()) {
+            if (precision.min_precision > 0 && amount < precision.min_precision) {
+                return Err(Error::InvalidAmount);
+            }
+            if precision.max_single_tx > 0 && amount > precision.max_single_tx {
+                return Err(Error::InvalidAmount);
+            }
+
+            // Update & check tracker
+            let mut trackers: Map<Address, SpendingTracker> = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("SPEND_TR"))
+                .unwrap_or_else(|| Map::new(&env));
+
+            let mut tracker = trackers.get(caller.clone()).unwrap_or(SpendingTracker {
+                current_spent: 0,
+                last_tx_timestamp: 0,
+                tx_count: 0,
+                period: SpendingPeriod {
+                    period_type: 0,
+                    period_start: env.ledger().timestamp(),
+                    period_duration: 86400,
+                },
+            });
+
+            // Rollover check (if period elapsed, reset spending count)
+            if env.ledger().timestamp() >= tracker.period.period_start + tracker.period.period_duration {
+                tracker.current_spent = 0;
+                tracker.tx_count = 0;
+                tracker.period.period_start = env.ledger().timestamp();
+            }
+
+            // Cumulative check (only if enabled)
+            if precision.enable_rollover && precision.limit > 0 && tracker.current_spent + amount > precision.limit {
+                return Err(Error::InvalidSpendingLimit);
+            }
+
+            tracker.current_spent += amount;
+            tracker.last_tx_timestamp = env.ledger().timestamp();
+            tracker.tx_count += 1;
+            trackers.set(caller, tracker);
+
+            env.storage()
+                .instance()
+                .set(&symbol_short!("SPEND_TR"), &trackers);
+        }
+
+        Ok(())
+    }
+
+    /// Set a precision spending limit for a member.
+    pub fn set_precision_spending_limit(
+        env: Env,
+        caller: Address,
+        member: Address,
+        limit: PrecisionSpendingLimit,
+    ) -> Result<bool, Error> {
+        caller.require_auth();
+        Self::require_not_paused(&env);
+        if !Self::is_owner_or_admin(&env, &caller) {
+            return Err(Error::Unauthorized);
+        }
+        if limit.limit < 0 || limit.min_precision < 0 || limit.max_single_tx < 0 
+           || (limit.max_single_tx > 0 && limit.max_single_tx > limit.limit && limit.limit > 0) 
+           || (limit.min_precision == 0 && limit.limit > 0)
+        {
+            return Err(Error::InvalidPrecisionConfig);
+        }
+
+        let mut precision_limits: Map<Address, PrecisionSpendingLimit> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("PREC_LIM"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        precision_limits.set(member, limit);
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("PREC_LIM"), &precision_limits);
+
+        Ok(true)
+    }
+
+    /// Get the precision spending limit for a member.
+    pub fn get_precision_spending_limit(env: Env, member: Address) -> Option<PrecisionSpendingLimit> {
+        let precision_limits: Map<Address, PrecisionSpendingLimit> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("PREC_LIM"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        precision_limits.get(member)
+    }
+
+    /// Get the current spending tracker for a member.
+    pub fn get_spending_tracker(env: Env, member: Address) -> Option<SpendingTracker> {
+        let trackers: Map<Address, SpendingTracker> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("SPEND_TR"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        trackers.get(member)
+    }
+
+    /// Update the spending tracker for a member (usually used internally or for testing).
+    pub fn set_spending_tracker(
+        env: Env,
+        caller: Address,
+        member: Address,
+        tracker: SpendingTracker,
+    ) -> Result<bool, Error> {
+        caller.require_auth();
+        Self::require_not_paused(&env);
+        if !Self::is_owner_or_admin(&env, &caller) {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut trackers: Map<Address, SpendingTracker> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("SPEND_TR"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        trackers.set(member, tracker);
+
+        env.storage()
+            .instance()
+            .set(&symbol_short!("SPEND_TR"), &trackers);
+
+        Ok(true)
+    }
+
+    /// Set the proposal expiry duration in seconds.
+    ///
+    /// # Authorization
+    /// Only Owner or Admin can update this setting.
+    ///
+    /// # Errors
+    /// - `Unauthorized` if caller is not Owner or Admin
+    /// - `ThresholdAboveMaximum` if duration exceeds MAX_PROPOSAL_EXPIRY
+    pub fn set_proposal_expiry(env: Env, caller: Address, duration_secs: u64) -> Result<bool, Error> {
+        caller.require_auth();
+        Self::require_not_paused(&env);
+        if !Self::is_owner_or_admin(&env, &caller) {
+            return Err(Error::Unauthorized);
+        }
+        if duration_secs > MAX_PROPOSAL_EXPIRY {
+            return Err(Error::ThresholdAboveMaximum);
+        }
+        Self::extend_instance_ttl(&env);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("PROP_EXP"), &duration_secs);
+        Ok(true)
+    }
+
+    /// Get the current proposal expiry duration in seconds.
+    pub fn get_proposal_expiry_public(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&symbol_short!("PROP_EXP"))
+            .unwrap_or(DEFAULT_PROPOSAL_EXPIRY)
+    }
+
+    /// Cancel a pending transaction.
+    ///
+    /// Only the original proposer or an Owner/Admin may cancel.
+    ///
+    /// # Errors
+    /// - `Unauthorized` if caller is neither proposer nor Owner/Admin
+    /// - `TransactionNotFound` if the tx_id doesn't exist
+    pub fn cancel_transaction(env: Env, caller: Address, tx_id: u64) -> Result<bool, Error> {
+        caller.require_auth();
+        Self::require_not_paused(&env);
+
+        let mut pending_txs: Map<u64, PendingTransaction> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("PEND_TXS"))
+            .unwrap_or_else(|| Map::new(&env));
+
+        let tx = pending_txs
+            .get(tx_id)
+            .ok_or(Error::TransactionNotFound)?;
+
+        // Only proposer or owner/admin can cancel
+        if tx.proposer != caller && !Self::is_owner_or_admin(&env, &caller) {
+            return Err(Error::Unauthorized);
+        }
+
+        pending_txs.remove(tx_id);
+        Self::extend_instance_ttl(&env);
+        env.storage()
+            .instance()
+            .set(&symbol_short!("PEND_TXS"), &pending_txs);
+
+        Ok(true)
     }
 }
 

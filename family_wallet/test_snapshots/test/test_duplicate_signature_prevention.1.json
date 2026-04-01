@@ -1691,7 +1691,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'Already signed this transaction' from contract function 'Symbol(obj#531)'"
+                  "string": "caught panic 'Already signed this transaction' from contract function 'Symbol(obj#539)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"

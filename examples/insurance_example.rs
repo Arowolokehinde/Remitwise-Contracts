@@ -16,24 +16,22 @@ fn main() {
     println!("--- Remitwise: Insurance Example ---");
 
     // 4. [Write] Create a new insurance policy
-    let policy_name = String::from_str(&env, "Health Insurance");
-    let coverage_type = String::from_str(&env, "HMO");
-    let monthly_premium = 200i128;
-    let coverage_amount = 50000i128;
+    use remitwise_common::CoverageType;
+    let coverage_type = CoverageType::Health;
+    let external_ref = None;
 
     println!(
-        "Creating policy: '{}' with premium: {} and coverage: {}",
+        "Creating policy: '{:?}' with premium: {} and coverage: {}",
         policy_name, monthly_premium, coverage_amount
     );
-    let policy_id = client
-        .create_policy(
-            &owner,
-            &policy_name,
-            &coverage_type,
-            &monthly_premium,
-            &coverage_amount,
-        )
-        .unwrap();
+    let policy_id = client.create_policy(
+        &owner,
+        &policy_name,
+        &coverage_type,
+        &monthly_premium,
+        &coverage_amount,
+        &external_ref,
+    );
     println!("Policy created successfully with ID: {}", policy_id);
 
     // 5. [Read] List active policies
@@ -41,14 +39,14 @@ fn main() {
     println!("\nActive Policies for {:?}:", owner);
     for policy in policy_page.items.iter() {
         println!(
-            "  ID: {}, Name: {}, Premium: {}, Coverage: {}",
+            "  ID: {}, Name: {:?}, Premium: {}, Coverage: {}",
             policy.id, policy.name, policy.monthly_premium, policy.coverage_amount
         );
     }
 
     // 6. [Write] Pay a premium
     println!("\nPaying premium for policy ID: {}...", policy_id);
-    client.pay_premium(&owner, &policy_id).unwrap();
+    client.pay_premium(&owner, &policy_id);
     println!("Premium paid successfully!");
 
     // 7. [Read] Verify policy status (next payment date updated)

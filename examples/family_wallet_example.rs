@@ -1,4 +1,5 @@
-use family_wallet::{FamilyRole, FamilyWallet, FamilyWalletClient};
+use family_wallet::{FamilyWallet, FamilyWalletClient};
+use remitwise_common::FamilyRole;
 use soroban_sdk::{testutils::Address as _, Address, Env, Vec};
 
 fn main() {
@@ -35,11 +36,7 @@ fn main() {
 
     // 6. [Write] Add a new family member with a specific role and spending limit
     println!("\nAdding new member: {:?}", member2);
-    let spending_limit = 1000i128;
-    client
-        .add_member(&owner, &member2, &FamilyRole::Member, &spending_limit)
-        .unwrap();
-    println!("Member added successfully!");
+    client.add_member(&owner, &member2, &FamilyRole::Member, &spending_limit);
 
     // 7. [Read] Verify the new member
     let m2_member = client.get_member(&member2).unwrap();

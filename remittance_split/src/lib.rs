@@ -7,7 +7,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token::TokenClient, vec,
     Address, BytesN, Env, IntoVal, Map, Symbol, Vec,
 };
-use remitwise_common::{EventCategory, EventPriority, RemitwiseEvents};
+use remitwise_common::{clamp_limit, EventCategory, EventPriority, RemitwiseEvents};
 
 // Event topics
 const SPLIT_INITIALIZED: Symbol = symbol_short!("init");
@@ -44,10 +44,20 @@ pub enum RemittanceSplitError {
     /// A destination account is the same as the sender, which would be a no-op transfer.
     SelfTransferNotAllowed = 13,
     DeadlineExpired = 14,
-
     RequestHashMismatch = 15,
-
     NonceAlreadyUsed = 16,
+    /// Individual percentage value exceeded 100.
+    PercentageOutOfRange = 17,
+    /// Percentages do not sum to exactly 100.
+    PercentagesDoNotSumTo100 = 18,
+    /// Snapshot has initialized = false and cannot be restored.
+    SnapshotNotInitialized = 19,
+    /// Per-field percentage in snapshot exceeds 100.
+    InvalidPercentageRange = 20,
+    /// Snapshot or config timestamp is in the future.
+    FutureTimestamp = 21,
+    /// Snapshot owner does not match the calling address.
+    OwnerMismatch = 22,
 }
 
 #[derive(Clone)]
@@ -134,6 +144,8 @@ pub struct ExportSnapshot {
     pub checksum: u64,
     pub config: SplitConfig,
     pub schedules: Vec<RemittanceSchedule>,
+    /// Timestamp at which this snapshot was exported. Covered by FNV-1a checksum.
+    pub exported_at: u64,
 }
 
 /// Audit log entry for security and compliance.
@@ -196,6 +208,22 @@ const MAX_AUDIT_ENTRIES: u32 = 100;
 const DEFAULT_PAGE_LIMIT: u32 = 20;
 const MAX_PAGE_LIMIT: u32 = 50;
 const CONTRACT_VERSION: u32 = 1;
+
+/// Auth payload struct for replay-safe signed requests on initialize_split.
+#[contracttype]
+#[derive(Clone)]
+pub struct SplitAuthPayload {
+    pub domain_id: Symbol,
+    pub network_id: BytesN<32>,
+    pub contract_addr: Address,
+    pub owner_addr: Address,
+    pub nonce_val: u64,
+    pub usdc_contract: Address,
+    pub spending_percent: u32,
+    pub savings_percent: u32,
+    pub bills_percent: u32,
+    pub insurance_percent: u32,
+}
 
 #[contracttype]
 pub enum DataKey {
@@ -896,11 +924,13 @@ impl RemittanceSplit {
             (symbol_short!("split"), symbol_short!("snap_exp")),
             SCHEMA_VERSION,
         );
+        let current_time = env.ledger().timestamp();
         Ok(Some(ExportSnapshot {
             schema_version: SCHEMA_VERSION,
             checksum,
             config,
             schedules,
+            exported_at: current_time,
         }))
     }
 
@@ -1065,7 +1095,7 @@ impl RemittanceSplit {
         let expected = Self::compute_checksum(
             snapshot.schema_version,
             &snapshot.config,
-            snapshot.exported_at,
+            &snapshot.schedules,
         );
         if snapshot.checksum != expected {
             return Err(RemittanceSplitError::ChecksumMismatch);
@@ -1451,20 +1481,15 @@ impl RemittanceSplit {
             return Err(RemittanceSplitError::InvalidDueDate);
         }
 
-        let next_schedule_id = env
+        let current_max_id: u32 = env
             .storage()
             .instance()
             .get(&symbol_short!("NEXT_RSCH"))
             .unwrap_or(0u32);
-            
+
         let next_schedule_id = current_max_id
             .checked_add(1)
             .ok_or(RemittanceSplitError::Overflow)?;
-
-        // Explicit uniqueness check to prevent any potential storage collisions
-        if schedules.contains_key(next_schedule_id) {
-            return Err(RemittanceSplitError::Overflow); // Should be unreachable with monotonic counter
-        }
 
         let schedule = RemittanceSchedule {
             id: next_schedule_id,

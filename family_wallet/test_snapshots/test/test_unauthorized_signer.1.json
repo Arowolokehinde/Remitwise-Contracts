@@ -1618,7 +1618,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'Signer not authorized for this transaction type' from contract function 'Symbol(obj#429)'"
+                  "string": "caught panic 'Signer not authorized for this transaction type' from contract function 'Symbol(obj#435)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"

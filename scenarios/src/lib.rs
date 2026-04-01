@@ -1,5 +1,5 @@
 pub mod tests {
-    use soroban_sdk::testutils::{Ledger, LedgerInfo};
+    use soroban_sdk::{Env, testutils::{Ledger, LedgerInfo}};
 
     pub fn setup_env() -> Env {
         let env = Env::default();

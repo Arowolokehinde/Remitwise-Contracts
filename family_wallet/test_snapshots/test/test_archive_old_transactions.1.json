@@ -713,14 +713,16 @@
           "v0": {
             "topics": [
               {
-                "symbol": "wallet"
+                "symbol": "Remitwise"
               },
               {
-                "vec": [
-                  {
-                    "symbol": "TransactionsArchived"
-                  }
-                ]
+                "u32": 3
+              },
+              {
+                "u32": 0
+              },
+              {
+                "symbol": "archived"
               }
             ],
             "data": {

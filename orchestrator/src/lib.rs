@@ -69,6 +69,7 @@ pub enum OrchestratorError {
     DuplicateContractAddress = 11,
     ContractNotConfigured = 12,
     SelfReferenceNotAllowed = 13,
+    NonceAlreadyUsed = 14,
 }
 
 #[contracttype]
@@ -296,6 +297,17 @@ impl Orchestrator {
     ) -> Result<(), OrchestratorError> {
         Self::acquire_execution_lock(&env)?;
         caller.require_auth();
+        // Address validation
+        Self::validate_two_addresses(&env, &family_wallet_addr, &bills_addr).map_err(|e| {
+            Self::release_execution_lock(&env);
+            e
+        })?;
+        // Nonce / replay protection
+        Self::consume_nonce(&env, &caller, symbol_short!("exec_bil"), nonce).map_err(|e| {
+            Self::release_execution_lock(&env);
+            e
+        })?;
+
         let result = (|| {
             Self::check_spending_limit(&env, &family_wallet_addr, &caller, amount)?;
             Self::execute_bill_payment_internal(&env, &bills_addr, &caller, bill_id)?;
@@ -316,6 +328,17 @@ impl Orchestrator {
     ) -> Result<(), OrchestratorError> {
         Self::acquire_execution_lock(&env)?;
         caller.require_auth();
+        // Address validation
+        Self::validate_two_addresses(&env, &family_wallet_addr, &insurance_addr).map_err(|e| {
+            Self::release_execution_lock(&env);
+            e
+        })?;
+        // Nonce / replay protection
+        Self::consume_nonce(&env, &caller, symbol_short!("exec_ins"), nonce).map_err(|e| {
+            Self::release_execution_lock(&env);
+            e
+        })?;
+
         let result = (|| {
             Self::check_spending_limit(&env, &family_wallet_addr, &caller, amount)?;
             Self::pay_insurance_premium(&env, &insurance_addr, &caller, policy_id)?;
@@ -392,12 +415,46 @@ impl Orchestrator {
     }
 
     fn emit_error_event(env: &Env, caller: &Address, step: Symbol, code: u32, timestamp: u64) {
-        env.events().publish((symbol_short!("flow_err"),), RemittanceFlowErrorEvent {
-            caller: caller.clone(),
-            failed_step: step,
-            error_code: code,
-            timestamp,
-        });
+        env.events().publish(
+            (symbol_short!("flow_err"),),
+            RemittanceFlowErrorEvent {
+                caller: caller.clone(),
+                failed_step: step,
+                error_code: code,
+                timestamp,
+            },
+        );
+    }
+    
+    fn validate_two_addresses(
+        env: &Env,
+        a: &Address,
+        b: &Address,
+    ) -> Result<(), OrchestratorError> {
+        let current = env.current_contract_address();
+        if a == &current || b == &current {
+            return Err(OrchestratorError::SelfReferenceNotAllowed);
+        }
+        if a == b {
+            return Err(OrchestratorError::DuplicateContractAddress);
+        }
+        Ok(())
+    }
+
+    fn consume_nonce(
+        env: &Env,
+        caller: &Address,
+        op: Symbol,
+        nonce: u64,
+    ) -> Result<(), OrchestratorError> {
+        let key = (symbol_short!("NONCE"), caller.clone(), op, nonce);
+        if env.storage().temporary().has(&key) {
+            return Err(OrchestratorError::NonceAlreadyUsed);
+        }
+        env.storage().temporary().set(&key, &true);
+        // Extend TTL for nonce to prevent replay within reasonable window
+        env.storage().temporary().extend_ttl(&key, 17280, 17280); 
+        Ok(())
     }
 
     pub fn get_execution_stats(env: Env) -> ExecutionStats {
