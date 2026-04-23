@@ -228,6 +228,11 @@ pub trait InsuranceTrait {
     fn get_total_monthly_premium(env: Env, owner: Address) -> i128;
 }
 
+#[contractclient(name = "FamilyWalletClient")]
+pub trait FamilyWalletTrait {
+    fn get_owner(env: Env) -> Address;
+}
+
 // Data structures from other contracts (needed for client traits)
 
 #[contracttype]
@@ -605,12 +610,16 @@ impl ReportingContract {
             error_category: if insurance_ok { None } else { Some(soroban_sdk::String::from_str(&env, "get_total_monthly_premium_failed")) },
         });
 
-        // Check family_wallet - note: no direct client trait, so we can't check easily
-        // For now, mark as ok since addresses are configured
+        // Check family_wallet
+        let family_client = FamilyWalletClient::new(&env, &addresses.family_wallet);
+        let family_ok = match family_client.try_get_owner() {
+            Ok(Ok(_)) => true,
+            _ => false,
+        };
         statuses.push_back(DependencyStatus {
             name: soroban_sdk::String::from_str(&env, "family_wallet"),
-            ok: true,
-            error_category: None,
+            ok: family_ok,
+            error_category: if family_ok { None } else { Some(soroban_sdk::String::from_str(&env, "get_owner_failed")) },
         });
 
         Ok(statuses)

@@ -210,6 +210,20 @@ mod insurance {
     }
 }
 
+mod family_wallet {
+    use soroban_sdk::{contract, contractimpl, Address, Env};
+
+    #[contract]
+    pub struct FamilyWallet;
+
+    #[contractimpl]
+    impl FamilyWallet {
+        pub fn get_owner(env: Env) -> Address {
+            Address::from_contract_id(&env, &env.current_contract_address())
+        }
+    }
+}
+
 #[test]
 fn test_init_reporting_contract_succeeds() {
     let env = Env::default();
@@ -2191,7 +2205,7 @@ fn test_check_dependencies_succeeds_with_configured_contracts() {
     let savings_goals_id = env.register_contract(None, savings_goals::SavingsGoalsContract);
     let bill_payments_id = env.register_contract(None, bill_payments::BillPayments);
     let insurance_id = env.register_contract(None, insurance::Insurance);
-    let family_wallet = Address::generate(&env); // Not a contract, just an address
+    let family_wallet_id = env.register_contract(None, family_wallet::FamilyWallet);
 
     client.configure_addresses(
         &admin,
@@ -2199,7 +2213,7 @@ fn test_check_dependencies_succeeds_with_configured_contracts() {
         &Address::from_contract_id(&env, &savings_goals_id),
         &Address::from_contract_id(&env, &bill_payments_id),
         &Address::from_contract_id(&env, &insurance_id),
-        &family_wallet,
+        &Address::from_contract_id(&env, &family_wallet_id),
     );
 
     let statuses = client.check_dependencies(&admin).unwrap();
