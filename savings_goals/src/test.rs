@@ -3127,6 +3127,52 @@ fn test_add_tags_to_goal_empty_string_tag_panics() {
 }
 
 #[test]
+fn test_add_tags_to_goal_normalization_success() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let user = Address::generate(&env);
+
+    client.init();
+    env.mock_all_auths();
+    let goal_id = client.create_goal(
+        &user,
+        &String::from_str(&env, "NormalizeTag"),
+        &1000,
+        &2000000000,
+    );
+
+    let mut tags = SorobanVec::new(&env);
+    tags.push_back(String::from_str(&env, "URGENT-1_Tag"));
+    client.add_tags_to_goal(&user, &goal_id, &tags);
+
+    let goal = client.get_goal(&goal_id).unwrap();
+    assert_eq!(goal.tags.get(0).unwrap(), String::from_str(&env, "urgent-1_tag"));
+}
+
+#[test]
+#[should_panic]
+fn test_add_tags_to_goal_invalid_char_panics() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let user = Address::generate(&env);
+
+    client.init();
+    env.mock_all_auths();
+    let goal_id = client.create_goal(
+        &user,
+        &String::from_str(&env, "InvalidCharTag"),
+        &1000,
+        &2000000000,
+    );
+
+    let mut tags = SorobanVec::new(&env);
+    tags.push_back(String::from_str(&env, "invalid@tag!"));
+    client.add_tags_to_goal(&user, &goal_id, &tags);
+}
+
+#[test]
 #[should_panic(expected = "Goal not found")]
 fn test_add_tags_to_goal_nonexistent_goal_panics() {
     let env = Env::default();
