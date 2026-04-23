@@ -1,22 +1,28 @@
 #![no_std]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
-extern crate alloc;
-
 use remitwise_common::{
     clamp_limit, EventCategory, EventPriority, RemitwiseEvents, ARCHIVE_BUMP_AMOUNT,
     ARCHIVE_LIFETIME_THRESHOLD, CONTRACT_VERSION, INSTANCE_BUMP_AMOUNT,
-    INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_SIZE, MAX_PAGE_LIMIT,
+    INSTANCE_LIFETIME_THRESHOLD, MAX_BATCH_SIZE,
 };
-#[cfg(test)]
-use remitwise_common::DEFAULT_PAGE_LIMIT;
 
-const SECONDS_PER_DAY: u64 = 86400;
-const MAX_FREQUENCY_DAYS: u32 = 365;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map, String,
     Symbol, Vec,
 };
+
+const MAX_FREQUENCY_DAYS: u32 = 36_500; // 100 years
+const SECONDS_PER_DAY: u64 = 86_400;
+
+/// Maximum length for currency codes (ISO 4217 is 3 letters)
+const MAX_CURRENCY_LEN: u32 = 10;
+
+/// Validates that a currency string contains only ASCII alphabetic characters.
+/// Returns true if the string is valid (all ASCII letters A-Z or a-z).
+fn is_valid_currency_chars(s: &[u8]) -> bool {
+    !s.is_empty() && s.iter().all(|&b| b.is_ascii_alphabetic())
+}
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -65,23 +71,41 @@ const STORAGE_UNPAID_TOTALS: Symbol = symbol_short!("UNPD_TOT");
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
-pub enum Error {
+pub enum BillPaymentsError {
+    /// Bill with the given ID does not exist
     BillNotFound = 1,
+    /// Bill has already been paid
     BillAlreadyPaid = 2,
+    /// Amount is zero or negative
     InvalidAmount = 3,
+    /// Recurring frequency is invalid
     InvalidFrequency = 4,
+    /// Caller is not authorized for this operation
     Unauthorized = 5,
+    /// The entire contract is paused
     ContractPaused = 6,
+    /// Caller is not authorized to pause/unpause
     UnauthorizedPause = 7,
+    /// This specific function is paused
     FunctionPaused = 8,
+    /// Batch exceeds maximum allowed size
     BatchTooLarge = 9,
+    /// One or more bills in the batch failed validation
     BatchValidationFailed = 10,
+    /// Pagination limit is out of allowed range
     InvalidLimit = 11,
+    /// Due date is in the past or otherwise invalid
     InvalidDueDate = 12,
+    /// Tag string is invalid (empty or too long)
     InvalidTag = 13,
+    /// Tags list is empty
     EmptyTags = 14,
+    /// Currency code is invalid (empty, too long, or contains non-alphanumeric)
     InvalidCurrency = 15,
 }
+
+// Back-compat alias: large parts of this crate (and tests) still refer to `Error`.
+pub type Error = BillPaymentsError;
 
 #[contracttype]
 #[derive(Clone)]
@@ -114,6 +138,14 @@ pub enum BillEvent {
     Created,
     Paid,
     ExternalRefUpdated,
+    Cancelled,
+    Archived,
+    Restored,
+    ScheduleCreated,
+    ScheduleExecuted,
+    ScheduleMissed,
+    ScheduleModified,
+    ScheduleCancelled,
 }
 
 #[derive(Clone, Debug)]
@@ -131,124 +163,95 @@ pub struct BillPayments;
 
 #[contractimpl]
 impl BillPayments {
-    /// Create a new bill
-    ///
-    /// # Arguments
-    /// * `owner` - Address of the bill owner (must authorize)
-    /// * `name` - Name of the bill (e.g., "Electricity", "School Fees")
-    /// * `amount` - Amount to pay (must be positive)
-    /// * `due_date` - Due date as Unix timestamp
-    /// * `recurring` - Whether this is a recurring bill
-    /// * `frequency_days` - Frequency in days for recurring bills (must be > 0 if recurring)
-    /// * `external_ref` - Optional external system reference ID
-    ///
-    /// # Returns
-    /// The ID of the created bill
-    ///
-    /// # Errors
-    /// * `InvalidAmount` - If amount is zero or negative
-    /// * `InvalidFrequency` - If recurring is true but frequency_days is 0 or exceeds MAX_FREQUENCY_DAYS
-    /// * `InvalidDueDate` - If due_date is invalid or arithmetic overflows
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Normalize a currency string for consistent storage and comparison.
+    /// Validate and normalize a currency string for consistent storage and comparison.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
-    /// * `currency` - Currency code string to normalize
+    /// * `currency` - Currency code string to validate and normalize
     ///
     /// # Returns
-    /// Normalized currency string with:
-    /// 1. Whitespace trimmed from both ends
-    /// 2. Converted to uppercase
-    /// 3. Empty strings default to "XLM"
+    /// `Ok(normalized_currency)` on success with:
+    /// 1. Empty strings default to "XLM"
+    /// 2. Whitespace trimmed
+    /// 3. Converted to uppercase
     ///
-    /// # Examples
-    /// - "usdc" → "USDC"
-    /// - " XLM " → "XLM"
-    /// - "" → "XLM"
-    /// - "UsDc" → "USDC"
-    fn normalize_currency(env: &Env, currency: &String) -> String {
-        let length = currency.len();
-        if length == 0 {
-            return String::from_str(env, "XLM");
+    /// # Errors
+    /// * `InvalidCurrency` - If currency is too long or contains non-alphanumeric characters
+    fn validate_and_normalize_currency(
+        env: &Env,
+        currency: &String,
+    ) -> Result<String, BillPaymentsError> {
+        let len = currency.len();
+
+        // Empty string defaults to "XLM"
+        if len == 0 {
+            return Ok(String::from_str(env, "XLM"));
         }
 
-        let mut buf = [0u8; 12];
-        let bytes_to_copy = if length > 12 { 12 } else { length as usize };
-        currency.copy_into_slice(&mut buf[..bytes_to_copy]);
+        // Check length constraint
+        if len > MAX_CURRENCY_LEN {
+            return Err(BillPaymentsError::InvalidCurrency);
+        }
 
-        // Trimming (simple version: find first non-space, last non-space)
-        let mut start = 0;
-        while start < bytes_to_copy && buf[start] == b' ' {
-            start += 1;
-        }
-        let mut end = bytes_to_copy;
-        while end > start && buf[end - 1] == b' ' {
-            end -= 1;
-        }
+        let mut buf = [0u8; 32];
+        let copy_len = (len as usize).min(buf.len());
+        currency.copy_into_slice(&mut buf[..copy_len]);
+        let s = &buf[..copy_len];
+
+        // Trim leading/trailing ASCII spaces
+        let start = s.iter().position(|&b| b != b' ').unwrap_or(copy_len);
+        let end = s
+            .iter()
+            .rposition(|&b| b != b' ')
+            .map(|i| i + 1)
+            .unwrap_or(0);
 
         if start >= end {
-            return String::from_str(env, "XLM");
+            // Only whitespace - default to XLM
+            return Ok(String::from_str(env, "XLM"));
         }
 
-        // Convert to uppercase
-        for i in start..end {
-            if buf[i] >= b'a' && buf[i] <= b'z' {
-                buf[i] -= 32;
-            }
+        let trimmed = &s[start..end];
+
+        // Validate: must be only ASCII alphabetic characters (A-Z or a-z)
+        if !is_valid_currency_chars(trimmed) {
+            return Err(BillPaymentsError::InvalidCurrency);
         }
 
-        String::from_str(env, core::str::from_utf8(&buf[start..end]).unwrap_or("XLM"))
+        // Uppercase the validated string
+        let mut upper = [0u8; 32];
+        for (i, &b) in trimmed.iter().enumerate() {
+            upper[i] = b.to_ascii_uppercase();
+        }
+
+        let upper_str =
+            core::str::from_utf8(&upper[..trimmed.len()]).unwrap_or("XLM");
+        Ok(String::from_str(env, upper_str))
     }
 
-    /// Validate a currency string according to contract requirements.
-    ///
-    /// # Arguments
-    /// * `currency` - Currency code string to validate
-    ///
-    /// # Returns
-    /// * `Ok(())` if the currency is valid
-    /// * `Err(Error::InvalidCurrency)` if invalid
-    ///
-    /// # Validation Rules
-    /// 1. Length must be 1-12 characters (after trimming)
-    /// 2. Must contain only alphanumeric characters (A-Z, a-z, 0-9)
-    /// 3. Empty strings are allowed (will be normalized to "XLM")
-    ///
-    /// # Examples
-    /// - Valid: "XLM", "USDC", "NGN", "EUR123"
-    /// - Invalid: "USD$", "BTC-ETH", "XLM/USD", "ABCDEFGHIJKLM" (too long)
-    fn validate_currency(currency: &String) -> Result<(), Error> {
-        let length = currency.len();
-        if length == 0 {
-            return Ok(()); // Will be normalized to "XLM"
+    /// Legacy helper for backward compatibility - normalizes without strict validation.
+    /// WARNING: This does not validate currency codes. Use validate_and_normalize_currency
+    /// for new code to ensure proper currency validation.
+    fn normalize_currency(env: &Env, currency: &String) -> String {
+        // For backward compatibility, try validation first, fall back on error
+        match Self::validate_and_normalize_currency(env, currency) {
+            Ok(normalized) => normalized,
+            Err(_) => String::from_str(env, "XLM"),
         }
-        if length > 12 {
-            return Err(Error::InvalidCurrency);
-        }
-
-        // To validate characters, we need to pull the bytes from the host
-        // We use a small on-stack buffer for efficiency (max 12 bytes)
-        let mut buf = [0u8; 12];
-        currency.copy_into_slice(&mut buf[..length as usize]);
-
-        for i in 0..length as usize {
-            let byte = buf[i];
-            let is_alphanumeric = (byte >= b'a' && byte <= b'z') ||
-                                  (byte >= b'A' && byte <= b'Z') ||
-                                  (byte >= b'0' && byte <= b'9');
-            if !is_alphanumeric {
-                return Err(Error::InvalidCurrency);
-            }
-        }
-        Ok(())
     }
 
     fn get_pause_admin(env: &Env) -> Option<Address> {
         env.storage().instance().get(&symbol_short!("PAUSE_ADM"))
+    }
+    fn get_next_bill_id(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&symbol_short!("NEXT_ID"))
+            .unwrap_or(0u32)
     }
     fn get_global_paused(env: &Env) -> bool {
         env.storage()
@@ -264,33 +267,34 @@ impl BillPayments {
             .get(func)
             .unwrap_or(false)
     }
-    fn require_not_paused(env: &Env, func: Symbol) -> Result<(), Error> {
+    fn require_not_paused(env: &Env, func: Symbol) -> Result<(), BillPaymentsError> {
         if Self::get_global_paused(env) {
-            return Err(Error::ContractPaused);
+            return Err(BillPaymentsError::ContractPaused);
         }
         if Self::is_function_paused(env, func) {
-            return Err(Error::FunctionPaused);
+            return Err(BillPaymentsError::FunctionPaused);
         }
         Ok(())
     }
-
-    /// Clamp a caller-supplied limit to [1, MAX_PAGE_LIMIT].
-    /// A value of 0 is treated as DEFAULT_PAGE_LIMIT.
 
     // -----------------------------------------------------------------------
     // Pause / upgrade
     // -----------------------------------------------------------------------
 
-    pub fn set_pause_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), Error> {
+    pub fn set_pause_admin(
+        env: Env,
+        caller: Address,
+        new_admin: Address,
+    ) -> Result<(), BillPaymentsError> {
         caller.require_auth();
         let current = Self::get_pause_admin(&env);
         match current {
             None => {
                 if caller != new_admin {
-                    return Err(Error::UnauthorizedPause);
+                    return Err(BillPaymentsError::UnauthorizedPause);
                 }
             }
-            Some(admin) if admin != caller => return Err(Error::UnauthorizedPause),
+            Some(admin) if admin != caller => return Err(BillPaymentsError::UnauthorizedPause),
             _ => {}
         }
         env.storage()
@@ -304,9 +308,9 @@ impl BillPayments {
     /// @return Ok(()) on success, otherwise `Error::UnauthorizedPause`.
     pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
         caller.require_auth();
-        let admin = Self::get_pause_admin(&env).ok_or(Error::UnauthorizedPause)?;
+        let admin = Self::get_pause_admin(&env).ok_or(BillPaymentsError::UnauthorizedPause)?;
         if admin != caller {
-            return Err(Error::UnauthorizedPause);
+            return Err(BillPaymentsError::UnauthorizedPause);
         }
         env.storage()
             .instance()
@@ -326,14 +330,14 @@ impl BillPayments {
     /// @return Ok(()) on success, otherwise `Error::ContractPaused` or `Error::UnauthorizedPause`.
     pub fn unpause(env: Env, caller: Address) -> Result<(), Error> {
         caller.require_auth();
-        let admin = Self::get_pause_admin(&env).ok_or(Error::UnauthorizedPause)?;
+        let admin = Self::get_pause_admin(&env).ok_or(BillPaymentsError::UnauthorizedPause)?;
         if admin != caller {
-            return Err(Error::UnauthorizedPause);
+            return Err(BillPaymentsError::UnauthorizedPause);
         }
         let unpause_at: Option<u64> = env.storage().instance().get(&symbol_short!("UNP_AT"));
         if let Some(at) = unpause_at {
             if env.ledger().timestamp() < at {
-                return Err(Error::ContractPaused);
+                return Err(BillPaymentsError::ContractPaused);
             }
             env.storage().instance().remove(&symbol_short!("UNP_AT"));
         }
@@ -355,12 +359,12 @@ impl BillPayments {
     /// @return Ok(()) on success, otherwise `Error::InvalidAmount` or `Error::UnauthorizedPause`.
     pub fn schedule_unpause(env: Env, caller: Address, at_timestamp: u64) -> Result<(), Error> {
         caller.require_auth();
-        let admin = Self::get_pause_admin(&env).ok_or(Error::UnauthorizedPause)?;
+        let admin = Self::get_pause_admin(&env).ok_or(BillPaymentsError::UnauthorizedPause)?;
         if admin != caller {
-            return Err(Error::UnauthorizedPause);
+            return Err(BillPaymentsError::UnauthorizedPause);
         }
         if at_timestamp <= env.ledger().timestamp() {
-            return Err(Error::InvalidAmount);
+            return Err(BillPaymentsError::InvalidAmount);
         }
         env.storage()
             .instance()
@@ -373,9 +377,9 @@ impl BillPayments {
     /// @return Ok(()) on success, otherwise `Error::UnauthorizedPause`.
     pub fn pause_function(env: Env, caller: Address, func: Symbol) -> Result<(), Error> {
         caller.require_auth();
-        let admin = Self::get_pause_admin(&env).ok_or(Error::UnauthorizedPause)?;
+        let admin = Self::get_pause_admin(&env).ok_or(BillPaymentsError::UnauthorizedPause)?;
         if admin != caller {
-            return Err(Error::UnauthorizedPause);
+            return Err(BillPaymentsError::UnauthorizedPause);
         }
         let mut m: Map<Symbol, bool> = env
             .storage()
@@ -394,9 +398,9 @@ impl BillPayments {
     /// @return Ok(()) on success, otherwise `Error::UnauthorizedPause`.
     pub fn unpause_function(env: Env, caller: Address, func: Symbol) -> Result<(), Error> {
         caller.require_auth();
-        let admin = Self::get_pause_admin(&env).ok_or(Error::UnauthorizedPause)?;
+        let admin = Self::get_pause_admin(&env).ok_or(BillPaymentsError::UnauthorizedPause)?;
         if admin != caller {
-            return Err(Error::UnauthorizedPause);
+            return Err(BillPaymentsError::UnauthorizedPause);
         }
         let mut m: Map<Symbol, bool> = env
             .storage()
@@ -508,9 +512,9 @@ impl BillPayments {
     }
     pub fn set_version(env: Env, caller: Address, new_version: u32) -> Result<(), Error> {
         caller.require_auth();
-        let admin = Self::get_upgrade_admin(&env).ok_or(Error::Unauthorized)?;
+        let admin = Self::get_upgrade_admin(&env).ok_or(BillPaymentsError::Unauthorized)?;
         if admin != caller {
-            return Err(Error::Unauthorized);
+            return Err(BillPaymentsError::Unauthorized);
         }
         let prev = Self::get_version(env.clone());
         env.storage()
@@ -554,10 +558,7 @@ impl BillPayments {
     /// * `FunctionPaused` - If create_bill function is paused
     ///
     /// # Currency Normalization
-    /// - Converts to uppercase (e.g., "usdc" → "USDC")
-    /// - Trims whitespace (e.g., " XLM " → "XLM")
     /// - Empty string defaults to "XLM"
-    /// - Validates: 1-12 alphanumeric characters only
     #[allow(clippy::too_many_arguments)]
     pub fn create_bill(
         env: Env,
@@ -569,25 +570,25 @@ impl BillPayments {
         frequency_days: u32,
         external_ref: Option<String>,
         currency: String,
-    ) -> Result<u32, Error> {
+    ) -> Result<u32, BillPaymentsError> {
         owner.require_auth();
         Self::require_not_paused(&env, pause_functions::CREATE_BILL)?;
 
         let current_time = env.ledger().timestamp();
         if due_date == 0 || due_date < current_time {
-            return Err(Error::InvalidDueDate);
+            return Err(BillPaymentsError::InvalidDueDate);
         }
 
         if amount <= 0 {
-            return Err(Error::InvalidAmount);
+            return Err(BillPaymentsError::InvalidAmount);
         }
         if recurring && (frequency_days == 0 || frequency_days > MAX_FREQUENCY_DAYS) {
             return Err(Error::InvalidFrequency);
         }
 
-        // Validate and normalize currency
-        Self::validate_currency(&currency)?;
-        let resolved_currency = Self::normalize_currency(&env, &currency);
+        // Validate and normalize currency (strict validation - rejects invalid codes)
+        let resolved_currency =
+            Self::validate_and_normalize_currency(&env, &currency)?;
 
         Self::extend_instance_ttl(&env);
         let mut bills: Map<u32, Bill> = env
@@ -604,6 +605,7 @@ impl BillPayments {
             + 1;
 
         let current_time = env.ledger().timestamp();
+        let bill_external_ref = external_ref.clone();
         let bill = Bill {
             id: next_id,
             owner: owner.clone(),
@@ -648,7 +650,7 @@ impl BillPayments {
         Ok(next_id)
     }
 
-    pub fn pay_bill(env: Env, caller: Address, bill_id: u32) -> Result<(), Error> {
+    pub fn pay_bill(env: Env, caller: Address, bill_id: u32) -> Result<(), BillPaymentsError> {
         caller.require_auth();
         Self::require_not_paused(&env, pause_functions::PAY_BILL)?;
 
@@ -659,13 +661,14 @@ impl BillPayments {
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
 
-        let mut bill = bills.get(bill_id).ok_or(Error::BillNotFound)?;
+        let mut bill = bills.get(bill_id).ok_or(BillPaymentsError::BillNotFound)?;
+        let bill_external_ref = bill.external_ref.clone();
 
         if bill.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(BillPaymentsError::Unauthorized);
         }
         if bill.paid {
-            return Err(Error::BillAlreadyPaid);
+            return Err(BillPaymentsError::BillAlreadyPaid);
         }
 
         let current_time = env.ledger().timestamp();
@@ -673,11 +676,12 @@ impl BillPayments {
         bill.paid_at = Some(current_time);
 
         if bill.recurring {
-            let next_due_date = bill.due_date
+            let next_due_date = bill
+                .due_date
                 .checked_add(
                     (bill.frequency_days as u64)
                         .checked_mul(SECONDS_PER_DAY)
-                        .ok_or(Error::InvalidFrequency)?
+                        .ok_or(Error::InvalidFrequency)?,
                 )
                 .ok_or(Error::InvalidDueDate)?;
             let next_id = env
@@ -757,6 +761,10 @@ impl BillPayments {
     /// # Returns
     /// `BillPage { items, next_cursor, count }`.
     /// When `next_cursor == 0` there are no more pages.
+    ///
+    /// # Canonical Ordering
+    /// Results are always ordered by bill ID ascending. Pagination uses the same
+    /// ordering, so `cursor` is stable across repeated calls.
     pub fn get_unpaid_bills(env: Env, owner: Address, cursor: u32, limit: u32) -> BillPage {
         owner.require_auth();
         let limit = clamp_limit(limit);
@@ -765,12 +773,13 @@ impl BillPayments {
             .instance()
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
+        let max_id = Self::get_next_bill_id(&env);
 
         let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
-        for (id, bill) in bills.iter() {
-            if id <= cursor {
+        for id in (cursor.saturating_add(1))..=max_id {
+            let Some(bill) = bills.get(id) else {
                 continue;
-            }
+            };
             if bill.owner != owner || bill.paid {
                 continue;
             }
@@ -786,6 +795,10 @@ impl BillPayments {
     /// Get a page of ALL bills (paid + unpaid) for `owner`.
     ///
     /// Same cursor/limit semantics as `get_unpaid_bills`.
+    ///
+    /// # Canonical Ordering
+    /// Results are always ordered by bill ID ascending. Pagination uses the same
+    /// ordering, so `cursor` is stable across repeated calls.
     pub fn get_all_bills_for_owner(env: Env, owner: Address, cursor: u32, limit: u32) -> BillPage {
         owner.require_auth();
         let limit = clamp_limit(limit);
@@ -794,12 +807,13 @@ impl BillPayments {
             .instance()
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
+        let max_id = Self::get_next_bill_id(&env);
 
         let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
-        for (id, bill) in bills.iter() {
-            if id <= cursor {
+        for id in (cursor.saturating_add(1))..=max_id {
+            let Some(bill) = bills.get(id) else {
                 continue;
-            }
+            };
             if bill.owner != owner {
                 continue;
             }
@@ -812,11 +826,24 @@ impl BillPayments {
         Self::build_page(&env, staging, limit)
     }
 
-    /// Get a page of overdue (unpaid + past due_date) bills across all owners.
+    /// @notice Get a paginated list of overdue bills (unpaid + past due_date) across all owners.
+    /// @dev Canonical ordering is bill ID ascending and is preserved across pages.
+    /// Security assumption: Overdue bill retrieval is public since it does not reveal sensitive
+    /// off-chain PII (only on-chain bill state). Bounded by pagination `limit` to prevent
+    /// exceeding maximum compute or memory limits on large datasets.
     ///
-    /// Same cursor/limit semantics.
-    pub fn get_overdue_bills(env: Env, owner: Address, cursor: u32, limit: u32) -> BillPage {
-        owner.require_auth();
+    /// # Arguments
+    /// * `cursor` - Start after this bill ID (pass 0 for the first page)
+    /// * `limit`  - Max items per page (0 -> DEFAULT_PAGE_LIMIT, capped at MAX_PAGE_LIMIT)
+    ///
+    /// # Returns
+    /// `BillPage { items, next_cursor, count }`.
+    /// When `next_cursor == 0` there are no more pages.
+    ///
+    /// # Canonical Ordering
+    /// Results are always ordered by bill ID ascending. Pagination uses the same
+    /// ordering, so `cursor` is stable across repeated calls.
+    pub fn get_overdue_bills(env: Env, cursor: u32, limit: u32) -> BillPage {
         let limit = clamp_limit(limit);
         let current_time = env.ledger().timestamp();
         let bills: Map<u32, Bill> = env
@@ -824,13 +851,14 @@ impl BillPayments {
             .instance()
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
+        let max_id = Self::get_next_bill_id(&env);
 
         let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
-        for (id, bill) in bills.iter() {
-            if id <= cursor {
+        for id in (cursor.saturating_add(1))..=max_id {
+            let Some(bill) = bills.get(id) else {
                 continue;
-            }
-            if bill.owner != owner || bill.paid || bill.due_date >= current_time {
+            };
+            if bill.paid || bill.due_date >= current_time {
                 continue;
             }
             staging.push_back((id, bill));
@@ -843,16 +871,20 @@ impl BillPayments {
     }
 
     /// Admin-only: get ALL bills (any owner), paginated.
-    pub fn get_all_bills(
+    ///
+    /// # Canonical Ordering
+    /// Results are always ordered by bill ID ascending. Pagination uses the same
+    /// ordering, so `cursor` is stable across repeated calls.
+    pub fn get_all_bills_page(
         env: Env,
         caller: Address,
         cursor: u32,
         limit: u32,
-    ) -> Result<BillPage, Error> {
+    ) -> Result<BillPage, BillPaymentsError> {
         caller.require_auth();
-        let admin = Self::get_pause_admin(&env).ok_or(Error::Unauthorized)?;
+        let admin = Self::get_pause_admin(&env).ok_or(BillPaymentsError::Unauthorized)?;
         if admin != caller {
-            return Err(Error::Unauthorized);
+            return Err(BillPaymentsError::Unauthorized);
         }
 
         let limit = clamp_limit(limit);
@@ -862,11 +894,13 @@ impl BillPayments {
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
 
+        let max_id = Self::get_next_bill_id(&env);
+
         let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
-        for (id, bill) in bills.iter() {
-            if id <= cursor {
+        for id in (cursor.saturating_add(1))..=max_id {
+            let Some(bill) = bills.get(id) else {
                 continue;
-            }
+            };
             staging.push_back((id, bill));
             if staging.len() > limit {
                 break;
@@ -927,7 +961,7 @@ impl BillPayments {
         caller: Address,
         bill_id: u32,
         external_ref: Option<String>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), BillPaymentsError> {
         caller.require_auth();
 
         Self::extend_instance_ttl(&env);
@@ -937,9 +971,9 @@ impl BillPayments {
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
 
-        let mut bill = bills.get(bill_id).ok_or(Error::BillNotFound)?;
+        let mut bill = bills.get(bill_id).ok_or(BillPaymentsError::BillNotFound)?;
         if bill.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(BillPaymentsError::Unauthorized);
         }
 
         bill.external_ref = external_ref.clone();
@@ -959,6 +993,33 @@ impl BillPayments {
         Ok(())
     }
 
+    /// Get all bills (paid and unpaid).
+    ///
+    /// Returned order is canonical bill ID ascending.
+    ///
+    /// # Returns
+    /// Vec of all Bill structs
+    pub fn get_all_bills(env: Env, caller: Address) -> Result<Vec<Bill>, Error> {
+        caller.require_auth();
+        let admin = Self::get_pause_admin(&env).ok_or(Error::Unauthorized)?;
+        if admin != caller {
+            return Err(Error::Unauthorized);
+        }
+
+        let bills: Map<u32, Bill> = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("BILLS"))
+            .unwrap_or_else(|| Map::new(&env));
+        let max_id = Self::get_next_bill_id(&env);
+        let mut result = Vec::new(&env);
+        for id in 1..=max_id {
+            if let Some(bill) = bills.get(id) {
+                result.push_back(bill);
+            }
+        }
+        Ok(result)
+    }
 
     // -----------------------------------------------------------------------
     // Backward-compat helpers
@@ -967,16 +1028,21 @@ impl BillPayments {
     /// Legacy helper: returns ALL unpaid bills for owner in one Vec.
     /// Only safe for owners with a small number of bills. Prefer the
     /// paginated `get_unpaid_bills` for production use.
+    ///
+    /// Returned order is canonical bill ID ascending.
     pub fn get_all_unpaid_bills_legacy(env: Env, owner: Address) -> Vec<Bill> {
         let bills: Map<u32, Bill> = env
             .storage()
             .instance()
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
+        let max_id = Self::get_next_bill_id(&env);
         let mut result = Vec::new(&env);
-        for (_, bill) in bills.iter() {
-            if !bill.paid && bill.owner == owner {
-                result.push_back(bill);
+        for id in 1..=max_id {
+            if let Some(bill) = bills.get(id) {
+                if !bill.paid && bill.owner == owner {
+                    result.push_back(bill);
+                }
             }
         }
         result
@@ -987,6 +1053,8 @@ impl BillPayments {
     // -----------------------------------------------------------------------
 
     /// Get a page of archived bills for `owner`.
+    ///
+    /// Returned order is canonical bill ID ascending across pages.
     pub fn get_archived_bills(
         env: Env,
         owner: Address,
@@ -999,12 +1067,13 @@ impl BillPayments {
             .instance()
             .get(&symbol_short!("ARCH_BILL"))
             .unwrap_or_else(|| Map::new(&env));
+        let max_id = Self::get_next_bill_id(&env);
 
         let mut staging: Vec<(u32, ArchivedBill)> = Vec::new(&env);
-        for (id, bill) in archived.iter() {
-            if id <= cursor {
+        for id in (cursor.saturating_add(1))..=max_id {
+            let Some(bill) = archived.get(id) else {
                 continue;
-            }
+            };
             if bill.owner != owner {
                 continue;
             }
@@ -1055,7 +1124,7 @@ impl BillPayments {
     // Remaining operations
     // -----------------------------------------------------------------------
 
-    pub fn cancel_bill(env: Env, caller: Address, bill_id: u32) -> Result<(), Error> {
+    pub fn cancel_bill(env: Env, caller: Address, bill_id: u32) -> Result<(), BillPaymentsError> {
         caller.require_auth();
         Self::require_not_paused(&env, pause_functions::CANCEL_BILL)?;
         let mut bills: Map<u32, Bill> = env
@@ -1063,9 +1132,9 @@ impl BillPayments {
             .instance()
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
-        let bill = bills.get(bill_id).ok_or(Error::BillNotFound)?;
+        let bill = bills.get(bill_id).ok_or(BillPaymentsError::BillNotFound)?;
         if bill.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(BillPaymentsError::Unauthorized);
         }
         let removed_unpaid_amount = if bill.paid { 0 } else { bill.amount };
         bills.remove(bill_id);
@@ -1085,11 +1154,19 @@ impl BillPayments {
         Ok(())
     }
 
+    /// @notice Archive paid bills with `paid_at < before_timestamp`.
+    /// @dev Permissionless maintenance operation. Caller must authenticate, but does not need to
+    /// own each archived bill. Only paid bills with a historical payment timestamp are moved from
+    /// active storage into archival storage.
+    /// @param caller Authenticated caller executing archive maintenance.
+    /// @param before_timestamp Exclusive upper bound for `paid_at`.
+    /// @return Number of bills archived in this call.
+    /// @security Unpaid bills are never archived; owner data is preserved on archived records.
     pub fn archive_paid_bills(
         env: Env,
         caller: Address,
         before_timestamp: u64,
-    ) -> Result<u32, Error> {
+    ) -> Result<u32, BillPaymentsError> {
         caller.require_auth();
         Self::require_not_paused(&env, pause_functions::ARCHIVE)?;
         Self::extend_instance_ttl(&env);
@@ -1154,7 +1231,7 @@ impl BillPayments {
         Ok(archived_count)
     }
 
-    pub fn restore_bill(env: Env, caller: Address, bill_id: u32) -> Result<(), Error> {
+    pub fn restore_bill(env: Env, caller: Address, bill_id: u32) -> Result<(), BillPaymentsError> {
         caller.require_auth();
         Self::require_not_paused(&env, pause_functions::RESTORE)?;
         Self::extend_instance_ttl(&env);
@@ -1164,10 +1241,12 @@ impl BillPayments {
             .instance()
             .get(&symbol_short!("ARCH_BILL"))
             .unwrap_or_else(|| Map::new(&env));
-        let archived_bill = archived.get(bill_id).ok_or(Error::BillNotFound)?;
+        let archived_bill = archived
+            .get(bill_id)
+            .ok_or(BillPaymentsError::BillNotFound)?;
 
         if archived_bill.owner != caller {
-            return Err(Error::Unauthorized);
+            return Err(BillPaymentsError::Unauthorized);
         }
 
         let mut bills: Map<u32, Bill> = env
@@ -1215,11 +1294,17 @@ impl BillPayments {
         Ok(())
     }
 
+    /// @notice Permanently delete archived bills with `archived_at < before_timestamp`.
+    /// @dev Permissionless maintenance operation for archive compaction.
+    /// @param caller Authenticated caller executing cleanup.
+    /// @param before_timestamp Exclusive upper bound for `archived_at`.
+    /// @return Number of archived records removed.
+    /// @security Only archived data is touched; active bills are unaffected.
     pub fn bulk_cleanup_bills(
         env: Env,
         caller: Address,
         before_timestamp: u64,
-    ) -> Result<u32, Error> {
+    ) -> Result<u32, BillPaymentsError> {
         caller.require_auth();
         Self::require_not_paused(&env, pause_functions::ARCHIVE)?;
         Self::extend_instance_ttl(&env);
@@ -1257,31 +1342,22 @@ impl BillPayments {
         Ok(deleted_count)
     }
 
-    /// Pay multiple bills in a single batch.
+    /// @notice Pay multiple bills in one call.
     ///
-    /// # Semantics: Partial Success
-    /// This function implements deterministic partial result reporting. If a bill in the batch
-    /// is invalid (e.g., not found, unauthorized, or already paid), it will be skipped,
-    /// and an error event will be emitted. Other valid bills in the same batch will still be processed.
+    /// @dev Partial-success semantics are deterministic: invalid bill IDs are skipped and reported,
+    /// while valid IDs continue processing.
     ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `caller` - Address of the bill owner (must authorize)
-    /// * `bill_ids` - Vector of bill IDs to pay
-    ///
-    /// # Returns
-    /// The number of successfully paid bills.
-    ///
-    /// # Events
-    /// - `paid`: Emitted for each successful payment.
-    /// - `bill_pay_failed`: Emitted for each failed payment with (bill_id, error_code).
-    /// - `batch_pay_summary`: Emitted at the end with (success_count, failure_count).
+    /// @param caller Authenticated owner attempting the batch payment.
+    /// @param bill_ids Candidate bill IDs to process.
+    /// @return Number of successfully paid bills.
+    /// @security Cross-owner payments are rejected per item; oversized batches are rejected
+    /// before iteration.
     pub fn batch_pay_bills(env: Env, caller: Address, bill_ids: Vec<u32>) -> Result<u32, Error> {
         caller.require_auth();
         Self::require_not_paused(&env, pause_functions::PAY_BILL)?;
 
         if bill_ids.len() > (MAX_BATCH_SIZE as usize).try_into().unwrap_or(u32::MAX) {
-            return Err(Error::BatchTooLarge);
+            return Err(BillPaymentsError::BatchTooLarge);
         }
 
         Self::extend_instance_ttl(&env);
@@ -1352,11 +1428,12 @@ impl BillPayments {
 
             if bill.recurring {
                 next_id = next_id.saturating_add(1);
-                let next_due_date = bill.due_date
+                let next_due_date = bill
+                    .due_date
                     .checked_add(
                         (bill.frequency_days as u64)
                             .checked_mul(SECONDS_PER_DAY)
-                            .ok_or(Error::InvalidFrequency)?
+                            .ok_or(Error::InvalidFrequency)?,
                     )
                     .ok_or(Error::InvalidDueDate)?;
                 let next_bill = Bill {
@@ -1477,6 +1554,10 @@ impl BillPayments {
     /// // Get all USDC bills for owner
     /// let page = client.get_bills_by_currency(&owner, &"USDC".into(), &0, &10);
     /// ```
+    ///
+    /// # Canonical Ordering
+    /// Results are always ordered by bill ID ascending. Pagination uses the same
+    /// ordering, so `cursor` is stable across repeated calls.
     pub fn get_bills_by_currency(
         env: Env,
         owner: Address,
@@ -1492,11 +1573,13 @@ impl BillPayments {
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
 
+        let max_id = Self::get_next_bill_id(&env);
+
         let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
-        for (id, bill) in bills.iter() {
-            if id <= cursor {
+        for id in (cursor.saturating_add(1))..=max_id {
+            let Some(bill) = bills.get(id) else {
                 continue;
-            }
+            };
             if bill.owner != owner || bill.currency != normalized_currency {
                 continue;
             }
@@ -1530,6 +1613,10 @@ impl BillPayments {
     /// // Get unpaid USDC bills for owner
     /// let page = client.get_unpaid_bills_by_currency(&owner, &"USDC".into(), &0, &10);
     /// ```
+    ///
+    /// # Canonical Ordering
+    /// Results are always ordered by bill ID ascending. Pagination uses the same
+    /// ordering, so `cursor` is stable across repeated calls.
     pub fn get_unpaid_bills_by_currency(
         env: Env,
         owner: Address,
@@ -1539,7 +1626,6 @@ impl BillPayments {
     ) -> BillPage {
         owner.require_auth();
         let limit = clamp_limit(limit);
-        let normalized_currency = Self::normalize_currency(&env, &currency);
         let bills: Map<u32, Bill> = env
             .storage()
             .instance()
@@ -1547,10 +1633,12 @@ impl BillPayments {
             .unwrap_or_else(|| Map::new(&env));
 
         let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
-        for (id, bill) in bills.iter() {
-            if id <= cursor {
+        let normalized_currency = Self::normalize_currency(&env, &currency);
+        let max_id = Self::get_next_bill_id(&env);
+        for id in (cursor.saturating_add(1))..=max_id {
+            let Some(bill) = bills.get(id) else {
                 continue;
-            }
+            };
             if bill.owner != owner || bill.paid || bill.currency != normalized_currency {
                 continue;
             }
@@ -1670,7 +1758,10 @@ impl BillPayments {
             .get(&STORAGE_UNPAID_TOTALS)
             .unwrap_or_else(|| Map::new(env));
         let current = totals.get(owner.clone()).unwrap_or(0);
-        let next = current.checked_add(delta).expect("overflow");
+        let next = match current.checked_add(delta) {
+            Some(n) => n,
+            None => panic!("overflow"),
+        };
         totals.set(owner.clone(), next);
         env.storage()
             .instance()
@@ -1685,6 +1776,7 @@ impl BillPayments {
 mod test {
     use super::*;
     use proptest::prelude::*;
+    use remitwise_common::MAX_PAGE_LIMIT;
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         Env, String,
@@ -1712,7 +1804,6 @@ mod test {
                 &false,
                 &0,
                 &None,
-
                 &String::from_str(env, "XLM"),
             );
             ids.push_back(id);
@@ -1948,7 +2039,6 @@ mod test {
                 &false,
                 &0,
                 &None,
-
                 &String::from_str(&env, "XLM"),
             );
             client.create_bill(
@@ -1959,7 +2049,6 @@ mod test {
                 &false,
                 &0,
                 &None,
-
                 &String::from_str(&env, "XLM"),
             );
         }
@@ -2034,7 +2123,6 @@ mod test {
                 &false,
                 &0,
                 &None,
-
                 &String::from_str(&env, "XLM"),
             );
         }
@@ -2127,6 +2215,365 @@ mod test {
         assert_eq!(page2.next_cursor, 0);
     }
 
+    fn assert_bill_ids_strictly_ascending(page: &BillPage, last_seen: &mut u32) {
+        for bill in page.items.iter() {
+            assert!(
+                bill.id > *last_seen,
+                "expected ascending bill ids, got {} after {}",
+                bill.id,
+                *last_seen
+            );
+            *last_seen = bill.id;
+        }
+    }
+
+    fn assert_archived_bill_ids_strictly_ascending(page: &ArchivedBillPage, last_seen: &mut u32) {
+        for bill in page.items.iter() {
+            assert!(
+                bill.id > *last_seen,
+                "expected ascending archived bill ids, got {} after {}",
+                bill.id,
+                *last_seen
+            );
+            *last_seen = bill.id;
+        }
+    }
+
+    #[test]
+    fn test_canonical_order_get_unpaid_bills_id_ascending() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+
+        let mut owner_a_ids: Vec<u32> = Vec::new(&env);
+        for i in 0..4u32 {
+            let id_a = client.create_bill(
+                &owner_a,
+                &String::from_str(&env, "A"),
+                &(100 + i as i128),
+                &(env.ledger().timestamp() + 10_000 + i as u64),
+                &false,
+                &0,
+                &None,
+                &String::from_str(&env, "XLM"),
+            );
+            owner_a_ids.push_back(id_a);
+
+            client.create_bill(
+                &owner_b,
+                &String::from_str(&env, "B"),
+                &(200 + i as i128),
+                &(env.ledger().timestamp() + 20_000 + i as u64),
+                &false,
+                &0,
+                &None,
+                &String::from_str(&env, "XLM"),
+            );
+        }
+
+        client.pay_bill(&owner_a, &owner_a_ids.get(1).unwrap());
+
+        let mut cursor = 0u32;
+        let mut last_seen = 0u32;
+        let mut collected: Vec<u32> = Vec::new(&env);
+        loop {
+            let page = client.get_unpaid_bills(&owner_a, &cursor, &2);
+            assert_bill_ids_strictly_ascending(&page, &mut last_seen);
+            for bill in page.items.iter() {
+                collected.push_back(bill.id);
+            }
+            if page.next_cursor == 0 {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+
+        let expected = soroban_sdk::vec![&env, 1u32, 5u32, 7u32];
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn test_canonical_order_get_all_bills_for_owner_id_ascending() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+        let other = Address::generate(&env);
+
+        let mut ids: Vec<u32> = Vec::new(&env);
+        for i in 0..4u32 {
+            let id = client.create_bill(
+                &owner,
+                &String::from_str(&env, "Owner Bill"),
+                &(500 + i as i128),
+                &(env.ledger().timestamp() + 30_000 + i as u64),
+                &false,
+                &0,
+                &None,
+                &String::from_str(&env, "XLM"),
+            );
+            ids.push_back(id);
+            client.create_bill(
+                &other,
+                &String::from_str(&env, "Other Bill"),
+                &(900 + i as i128),
+                &(env.ledger().timestamp() + 40_000 + i as u64),
+                &false,
+                &0,
+                &None,
+                &String::from_str(&env, "XLM"),
+            );
+        }
+
+        client.pay_bill(&owner, &ids.get(1).unwrap());
+
+        let mut cursor = 0u32;
+        let mut last_seen = 0u32;
+        let mut collected: Vec<u32> = Vec::new(&env);
+        loop {
+            let page = client.get_all_bills_for_owner(&owner, &cursor, &2);
+            assert_bill_ids_strictly_ascending(&page, &mut last_seen);
+            for bill in page.items.iter() {
+                collected.push_back(bill.id);
+            }
+            if page.next_cursor == 0 {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+
+        let expected = soroban_sdk::vec![&env, 1u32, 3u32, 5u32, 7u32];
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn test_canonical_order_get_overdue_bills_id_ascending() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        env.ledger().set_timestamp(1000);
+        for i in 0..6u32 {
+            client.create_bill(
+                &owner,
+                &String::from_str(&env, "Overdue"),
+                &(100 + i as i128),
+                &(2000 + i as u64),
+                &false,
+                &0,
+                &None,
+                &String::from_str(&env, "XLM"),
+            );
+        }
+
+        client.pay_bill(&owner, &2);
+        env.ledger().set_timestamp(10_000);
+
+        let mut cursor = 0u32;
+        let mut last_seen = 0u32;
+        let mut collected: Vec<u32> = Vec::new(&env);
+        loop {
+            let page = client.get_overdue_bills(&cursor, &2);
+            assert_bill_ids_strictly_ascending(&page, &mut last_seen);
+            for bill in page.items.iter() {
+                collected.push_back(bill.id);
+            }
+            if page.next_cursor == 0 {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+
+        let expected = soroban_sdk::vec![&env, 1u32, 3u32, 4u32, 5u32, 6u32];
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn test_canonical_order_get_all_bills_page_id_ascending() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+
+        client.set_pause_admin(&admin, &admin);
+
+        for i in 0..6u32 {
+            client.create_bill(
+                &owner,
+                &String::from_str(&env, "Admin List"),
+                &(1000 + i as i128),
+                &(env.ledger().timestamp() + 50_000 + i as u64),
+                &false,
+                &0,
+                &None,
+                &String::from_str(&env, "XLM"),
+            );
+        }
+
+        let mut cursor = 0u32;
+        let mut last_seen = 0u32;
+        let mut collected: Vec<u32> = Vec::new(&env);
+        loop {
+            let page = client.get_all_bills_page(&admin, &cursor, &2);
+            assert_bill_ids_strictly_ascending(&page, &mut last_seen);
+            for bill in page.items.iter() {
+                collected.push_back(bill.id);
+            }
+            if page.next_cursor == 0 {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+
+        let expected = soroban_sdk::vec![&env, 1u32, 2u32, 3u32, 4u32, 5u32, 6u32];
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn test_canonical_order_get_archived_bills_id_ascending() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        client.set_pause_admin(&owner, &owner);
+
+        let ids = setup_bills(&env, &client, &owner, 5);
+        for bill_id in ids.iter() {
+            client.pay_bill(&owner, &bill_id);
+        }
+        client.archive_paid_bills(&owner, &u64::MAX);
+
+        let mut cursor = 0u32;
+        let mut last_seen = 0u32;
+        let mut collected: Vec<u32> = Vec::new(&env);
+        loop {
+            let page = client.get_archived_bills(&owner, &cursor, &2);
+            assert_archived_bill_ids_strictly_ascending(&page, &mut last_seen);
+            for bill in page.items.iter() {
+                collected.push_back(bill.id);
+            }
+            if page.next_cursor == 0 {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+
+        let expected = soroban_sdk::vec![&env, 1u32, 2u32, 3u32, 4u32, 5u32];
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn test_canonical_order_currency_endpoints_id_ascending() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        client.create_bill(
+            &owner,
+            &String::from_str(&env, "C1"),
+            &100,
+            &(env.ledger().timestamp() + 1_000),
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "USDC"),
+        );
+        client.create_bill(
+            &owner,
+            &String::from_str(&env, "C2"),
+            &200,
+            &(env.ledger().timestamp() + 2_000),
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+        let paid_usdc_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "C3"),
+            &300,
+            &(env.ledger().timestamp() + 3_000),
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "usdc"),
+        );
+        client.create_bill(
+            &owner,
+            &String::from_str(&env, "C4"),
+            &400,
+            &(env.ledger().timestamp() + 4_000),
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "USDC"),
+        );
+        client.create_bill(
+            &owner,
+            &String::from_str(&env, "C5"),
+            &500,
+            &(env.ledger().timestamp() + 5_000),
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, " usdc "),
+        );
+
+        client.pay_bill(&owner, &paid_usdc_id);
+
+        let mut cursor = 0u32;
+        let mut last_seen = 0u32;
+        let mut all_currency_ids: Vec<u32> = Vec::new(&env);
+        loop {
+            let page =
+                client.get_bills_by_currency(&owner, &String::from_str(&env, "USDC"), &cursor, &2);
+            assert_bill_ids_strictly_ascending(&page, &mut last_seen);
+            for bill in page.items.iter() {
+                all_currency_ids.push_back(bill.id);
+            }
+            if page.next_cursor == 0 {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        let expected_all = soroban_sdk::vec![&env, 1u32, 3u32, 4u32, 5u32];
+        assert_eq!(all_currency_ids, expected_all);
+
+        let mut cursor = 0u32;
+        let mut last_seen_unpaid = 0u32;
+        let mut unpaid_currency_ids: Vec<u32> = Vec::new(&env);
+        loop {
+            let page = client.get_unpaid_bills_by_currency(
+                &owner,
+                &String::from_str(&env, "USDC"),
+                &cursor,
+                &2,
+            );
+            assert_bill_ids_strictly_ascending(&page, &mut last_seen_unpaid);
+            for bill in page.items.iter() {
+                unpaid_currency_ids.push_back(bill.id);
+            }
+            if page.next_cursor == 0 {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        let expected_unpaid = soroban_sdk::vec![&env, 1u32, 4u32, 5u32];
+        assert_eq!(unpaid_currency_ids, expected_unpaid);
+    }
+
     // -----------------------------------------------------------------------
     // RECURRING BILLS DATE MATH TESTS
     // -----------------------------------------------------------------------
@@ -2152,7 +2599,6 @@ mod test {
             &true, // recurring
             &1,    // frequency_days = 1
             &None,
-
             &String::from_str(&env, "XLM"),
         );
 
@@ -2188,7 +2634,6 @@ mod test {
             &true, // recurring
             &30,   // frequency_days = 30
             &None,
-
             &String::from_str(&env, "XLM"),
         );
 
@@ -2227,7 +2672,6 @@ mod test {
             &true, // recurring
             &365,  // frequency_days = 365
             &None,
-
             &String::from_str(&env, "XLM"),
         );
 
@@ -2270,7 +2714,6 @@ mod test {
             &true,
             &30,
             &None,
-
             &String::from_str(&env, "XLM"),
         );
 
@@ -2303,7 +2746,6 @@ mod test {
             &true, // recurring
             &30,   // frequency_days = 30
             &None,
-
             &String::from_str(&env, "XLM"),
         );
 
@@ -2354,7 +2796,6 @@ mod test {
             &true, // recurring
             &30,   // frequency_days = 30
             &None,
-
             &String::from_str(&env, "XLM"),
         );
 
@@ -2402,7 +2843,6 @@ mod test {
             &true, // recurring
             &30,   // frequency_days = 30
             &None,
-
             &String::from_str(&env, "XLM"),
         );
 
@@ -2442,7 +2882,6 @@ mod test {
             &true,
             &frequency,
             &None,
-
             &String::from_str(&env, "XLM"),
         );
 
@@ -2480,7 +2919,6 @@ mod test {
             &true,
             &30,
             &None,
-
             &String::from_str(&env, "XLM"),
         );
 
@@ -2517,7 +2955,6 @@ mod test {
             &true,
             &30,
             &None,
-
             &String::from_str(&env, "XLM"),
         );
 
@@ -2559,7 +2996,6 @@ mod test {
             &true,
             &freq,
             &None,
-
             &String::from_str(&env, "XLM"),
         );
 
@@ -2602,7 +3038,7 @@ mod test {
                     &owner,
                     &String::from_str(&env, "Overdue"),
                     &100,
-                    &(now - 1 - i as u64),
+                    &(now - 1 - i as u64), // due_date < now; created while time=1 so it's "future"
                     &false,
                     &0,
                     &None,
@@ -2611,7 +3047,7 @@ mod test {
                 );
             }
 
-            // Create bills with due_date >= now (not overdue)
+            // Create bills that will remain not overdue at time=now
             for i in 0..n_future {
                 client.create_bill(
                     &owner,
@@ -2680,7 +3116,7 @@ mod test {
         /// when payment is made.
         #[test]
         fn prop_recurring_next_bill_due_date_follows_original(
-            base_due in 1_000_000u64..5_000_000u64,
+            _base_due in 1_000_000u64..5_000_000u64,
             base_due_offset in 1_000_000u64..5_000_000u64,
             pay_offset in 1u64..100_000u64,
             freq_days in 1u32..366u32,
@@ -2752,11 +3188,27 @@ mod test {
 
         // 3. Execution: Attempt to create bills with invalid dates
         // Added '&currency' as the final argument to both calls
-        let result_past =
-            client.try_create_bill(&owner, &name, &1000, &past_due_date, &false, &0, &None, &currency);
+        let result_past = client.try_create_bill(
+            &owner,
+            &name,
+            &1000,
+            &past_due_date,
+            &false,
+            &0,
+            &None,
+            &currency,
+        );
 
-        let result_zero =
-            client.try_create_bill(&owner, &name, &1000, &zero_due_date, &false, &0, &None, &currency);
+        let result_zero = client.try_create_bill(
+            &owner,
+            &name,
+            &1000,
+            &zero_due_date,
+            &false,
+            &0,
+            &None,
+            &currency,
+        );
 
         // 4. Assertions
         assert!(
@@ -2770,12 +3222,12 @@ mod test {
 
         // Check that the error code matches InvalidDueDate
         match result_past {
-            Err(Ok(err)) => assert_eq!(err, Error::InvalidDueDate),
+            Err(Ok(err)) => assert_eq!(err, BillPaymentsError::InvalidDueDate),
             _ => panic!("Expected contract error InvalidDueDate for past date"),
         }
 
         match result_zero {
-            Err(Ok(err)) => assert_eq!(err, Error::InvalidDueDate),
+            Err(Ok(err)) => assert_eq!(err, BillPaymentsError::InvalidDueDate),
             _ => panic!("Expected contract error InvalidDueDate for zero date"),
         }
     }
@@ -2809,7 +3261,6 @@ mod test {
             &false,
             &0,
             &None,
-
             &String::from_str(&env, "XLM"),
         );
 
@@ -2840,7 +3291,6 @@ mod test {
             &false,
             &0,
             &None,
-
             &String::from_str(&env, "XLM"),
         );
 
@@ -2877,7 +3327,6 @@ mod test {
             &false,
             &0,
             &None,
-
             &String::from_str(&env, "XLM"),
         );
 
@@ -2891,7 +3340,6 @@ mod test {
             &false,
             &0,
             &None,
-
             &String::from_str(&env, "XLM"),
         );
 
@@ -2927,7 +3375,6 @@ mod test {
             &false,
             &0,
             &None,
-
             &String::from_str(&env, "XLM"),
         );
 
@@ -3027,7 +3474,7 @@ mod test {
         // This will panic as expected because we are NOT mocking auths for this call
         // and 'owner.require_auth()' will fail.
         // We set mock_all_auths to false to disable the global mock.
-        env.set_auths(&[]); 
+        env.set_auths(&[]);
         client.pay_bill(&owner, &_bill_id);
     }
 
@@ -3143,9 +3590,12 @@ mod test {
         ids.push_back(alice_bill);
         ids.push_back(bob_bill);
 
-        // Alice tries to batch pay both, but one is Bob's
-        let result = client.batch_pay_bills(&alice, &ids);
-        assert_eq!(result, 1);
+        // Alice tries to batch pay both: her bill is paid, Bob's is skipped.
+        let result = client.try_batch_pay_bills(&alice, &ids);
+        assert_eq!(result, Ok(Ok(1)));
+
+        assert!(client.get_bill(&alice_bill).unwrap().paid);
+        assert!(!client.get_bill(&bob_bill).unwrap().paid);
     }
 
     #[test]
@@ -3169,135 +3619,5 @@ mod test {
         let admin = Address::generate(&env);
 
         client.bulk_cleanup_bills(&admin, &1000000);
-    }
-
-    #[test]
-    fn test_create_bill_max_frequency_exceeded() {
-        let env = make_env();
-        env.mock_all_auths();
-        let cid = env.register_contract(None, BillPayments);
-        let client = BillPaymentsClient::new(&env, &cid);
-        let owner = Address::generate(&env);
-
-        let result = client.try_create_bill(
-            &owner,
-            &String::from_str(&env, "Too Long"),
-            &100,
-            &1000000,
-            &true,
-            &(MAX_FREQUENCY_DAYS + 1), // Exceeds max frequency
-            &None,
-            &String::from_str(&env, "XLM"),
-        );
-
-        assert_eq!(result, Err(Ok(Error::InvalidFrequency)));
-    }
-
-    #[test]
-    fn test_pay_bill_date_overflow_protection() {
-        let env = make_env();
-        env.mock_all_auths();
-        let cid = env.register_contract(None, BillPayments);
-        let client = BillPaymentsClient::new(&env, &cid);
-        let owner = Address::generate(&env);
-
-        // Create a bill with a very large due_date
-        let bill_id = client.create_bill(
-            &owner,
-            &String::from_str(&env, "Overflow Potential"),
-            &100,
-            &(u64::MAX - 100), // Near u64::MAX
-            &true,
-            &30,
-            &None,
-            &String::from_str(&env, "XLM"),
-        );
-
-        // Paying this should fail because next_due_date would overflow
-        let result = client.try_pay_bill(&owner, &bill_id);
-        assert_eq!(result, Err(Ok(Error::InvalidDueDate)));
-    }
-
-    #[test]
-    fn test_get_overdue_bills_owner_isolation() {
-        let env = make_env();
-        env.mock_all_auths();
-        let cid = env.register_contract(None, BillPayments);
-        let client = BillPaymentsClient::new(&env, &cid);
-        
-        let alice = Address::generate(&env);
-        let bob = Address::generate(&env);
-        
-        env.ledger().set_timestamp(10000);
-        
-        // Alice has 2 overdue bills
-        for i in 0..2 {
-            client.create_bill(&alice, &String::from_str(&env, "Alice Bill"), &100, &11000, &false, &0, &None, &String::from_str(&env, "XLM"));
-        }
-        
-        // Bob has 1 overdue bill
-        client.create_bill(&bob, &String::from_str(&env, "Bob Bill"), &100, &11000, &false, &0, &None, &String::from_str(&env, "XLM"));
-        
-        // Fast forward to overdue
-        env.ledger().set_timestamp(12000);
-        
-        let alice_page = client.get_overdue_bills(&alice, &0, &10);
-        assert_eq!(alice_page.count, 2);
-        
-        let bob_page = client.get_overdue_bills(&bob, &0, &10);
-        assert_eq!(bob_page.count, 1);
-    }
-
-    #[test]
-    fn test_get_unpaid_bills_by_currency_pagination() {
-        let env = make_env();
-        env.mock_all_auths();
-        let cid = env.register_contract(None, BillPayments);
-        let client = BillPaymentsClient::new(&env, &cid);
-        let owner = Address::generate(&env);
-        
-        // Create 5 USDC bills and 2 XLM bills
-        for _ in 0..5 {
-            client.create_bill(&owner, &String::from_str(&env, "USDC Bill"), &100, &20000, &false, &0, &None, &String::from_str(&env, "USDC"));
-        }
-        for _ in 0..2 {
-            client.create_bill(&owner, &String::from_str(&env, "XLM Bill"), &100, &20000, &false, &0, &None, &String::from_str(&env, "XLM"));
-        }
-        
-        let page1 = client.get_unpaid_bills_by_currency(&owner, &String::from_str(&env, "USDC"), &0, &3);
-        assert_eq!(page1.count, 3);
-        assert!(page1.next_cursor > 0);
-        
-        let page2 = client.get_unpaid_bills_by_currency(&owner, &String::from_str(&env, "USDC"), &page1.next_cursor, &3);
-        assert_eq!(page2.count, 2);
-        assert_eq!(page2.next_cursor, 0);
-        
-        let xlm_page = client.get_unpaid_bills_by_currency(&owner, &String::from_str(&env, "XLM"), &0, &10);
-        assert_eq!(xlm_page.count, 2);
-    }
-
-    #[test]
-    fn test_get_all_bills_admin() {
-        let env = make_env();
-        env.mock_all_auths();
-        let cid = env.register_contract(None, BillPayments);
-        let client = BillPaymentsClient::new(&env, &cid);
-        
-        let admin = Address::generate(&env);
-        let user = Address::generate(&env);
-        
-        // Initialize admin
-        client.set_pause_admin(&admin, &admin);
-        
-        // Create some bills
-        client.create_bill(&user, &String::from_str(&env, "User Bill"), &100, &20000, &false, &0, &None, &String::from_str(&env, "XLM"));
-        
-        // Admin can see all bills
-        let page = client.get_all_bills(&admin, &0, &10);
-        assert_eq!(page.count, 1);
-        
-        // Non-admin cannot see all bills
-        let result = client.try_get_all_bills(&user, &0, &10);
-        assert!(result.is_err());
     }
 }

@@ -1,20 +1,20 @@
 #![no_std]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+use remitwise_common::{EventCategory, EventPriority, RemitwiseEvents};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map, String,
     Symbol, Vec,
 };
-use remitwise_common::{EventCategory, EventPriority, RemitwiseEvents};
 
 // Event topics
 const GOAL_CREATED: Symbol = symbol_short!("created");
-const FUNDS_ADDED: Symbol = symbol_short!("added");
 const GOAL_COMPLETED: Symbol = symbol_short!("completed");
 
 #[derive(Clone)]
 #[contracttype]
 pub struct GoalCreatedEvent {
     pub goal_id: u32,
+    pub owner: Address,
     pub name: String,
     pub target_amount: i128,
     pub target_date: u64,
@@ -25,6 +25,17 @@ pub struct GoalCreatedEvent {
 #[contracttype]
 pub struct FundsAddedEvent {
     pub goal_id: u32,
+    pub owner: Address,
+    pub amount: i128,
+    pub new_total: i128,
+    pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct FundsWithdrawnEvent {
+    pub goal_id: u32,
+    pub owner: Address,
     pub amount: i128,
     pub new_total: i128,
     pub timestamp: u64,
@@ -34,6 +45,7 @@ pub struct FundsAddedEvent {
 #[contracttype]
 pub struct GoalCompletedEvent {
     pub goal_id: u32,
+    pub owner: Address,
     pub name: String,
     pub final_amount: i128,
     pub timestamp: u64,
@@ -88,7 +100,7 @@ pub struct SavingsSchedule {
     pub missed_count: u32,
 }
 
-#[contracttype]
+#[contracterror]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SavingsGoalsError {
     InvalidAmount = 1,
@@ -97,49 +109,7 @@ pub enum SavingsGoalsError {
     GoalLocked = 4,
     InsufficientBalance = 5,
     Overflow = 6,
-}
-
-impl From<SavingsGoalsError> for soroban_sdk::Error {
-    fn from(err: SavingsGoalsError) -> Self {
-        match err {
-            SavingsGoalsError::InvalidAmount => soroban_sdk::Error::from((
-                soroban_sdk::xdr::ScErrorType::Contract,
-                soroban_sdk::xdr::ScErrorCode::InvalidInput,
-            )),
-            SavingsGoalsError::GoalNotFound => soroban_sdk::Error::from((
-                soroban_sdk::xdr::ScErrorType::Contract,
-                soroban_sdk::xdr::ScErrorCode::MissingValue,
-            )),
-            SavingsGoalsError::Unauthorized => soroban_sdk::Error::from((
-                soroban_sdk::xdr::ScErrorType::Contract,
-                soroban_sdk::xdr::ScErrorCode::InvalidAction,
-            )),
-            SavingsGoalsError::GoalLocked => soroban_sdk::Error::from((
-                soroban_sdk::xdr::ScErrorType::Contract,
-                soroban_sdk::xdr::ScErrorCode::InvalidAction,
-            )),
-            SavingsGoalsError::InsufficientBalance => soroban_sdk::Error::from((
-                soroban_sdk::xdr::ScErrorType::Contract,
-                soroban_sdk::xdr::ScErrorCode::InvalidInput,
-            )),
-            SavingsGoalsError::Overflow => soroban_sdk::Error::from((
-                soroban_sdk::xdr::ScErrorType::Contract,
-                soroban_sdk::xdr::ScErrorCode::InvalidInput,
-            )),
-        }
-    }
-}
-
-impl From<&SavingsGoalsError> for soroban_sdk::Error {
-    fn from(err: &SavingsGoalsError) -> Self {
-        (*err).into()
-    }
-}
-
-impl From<soroban_sdk::Error> for SavingsGoalsError {
-    fn from(_err: soroban_sdk::Error) -> Self {
-        SavingsGoalsError::Unauthorized
-    }
+    InvalidTagContent = 7,
 }
 
 #[contracttype]
@@ -426,7 +396,8 @@ impl SavingsGoalContract {
                 // Admin transfer - only current admin can transfer
                 if *current_admin != caller {
                     panic!("Unauthorized: only current upgrade admin can transfer");
-            panic!("Unauthorized: bootstrap requires caller == new_admin");
+                }
+            }
         }
 
         env.storage()
@@ -480,15 +451,33 @@ impl SavingsGoalContract {
     /// Requirements:
     /// - At least one tag must be provided.
     /// - Each tag length must be between 1 and 32 characters.
-    fn validate_tags(tags: &Vec<String>) {
+    /// - Allowed charset: [a-z0-9-_]. Uppercase is normalized to lowercase.
+    fn validate_and_normalize_tags(env: &Env, tags: &Vec<String>) -> Vec<String> {
         if tags.is_empty() {
             panic!("Tags cannot be empty");
         }
+        let mut normalized_tags = Vec::new(env);
         for tag in tags.iter() {
-            if tag.len() == 0 || tag.len() > 32 {
+            let len = tag.len();
+            if len == 0 || len > 32 {
                 panic!("Tag must be between 1 and 32 characters");
             }
+            let mut buf = [0u8; 32];
+            tag.copy_into_slice(&mut buf[..len as usize]);
+            
+            for i in 0..(len as usize) {
+                let mut c = buf[i];
+                if c >= b'A' && c <= b'Z' {
+                    c = c + (b'a' - b'A');
+                    buf[i] = c;
+                }
+                if !((c >= b'a' && c <= b'z') || (c >= b'0' && c <= b'9') || c == b'-' || c == b'_') {
+                    soroban_sdk::panic_with_error!(env, SavingsGoalsError::InvalidTagContent);
+                }
+            }
+            normalized_tags.push_back(String::from_slice(env, &buf[..len as usize]));
         }
+        normalized_tags
     }
 
     /// Adds tags to a goal's metadata.
@@ -500,14 +489,9 @@ impl SavingsGoalContract {
     /// Notes:
     /// - Duplicate tags are preserved as provided.
     /// - Emits `(savings, tags_add)` with `(goal_id, caller, tags)`.
-    pub fn add_tags_to_goal(
-        env: Env,
-        caller: Address,
-        goal_id: u32,
-        tags: Vec<String>,
-    ) {
+    pub fn add_tags_to_goal(env: Env, caller: Address, goal_id: u32, tags: Vec<String>) {
         caller.require_auth();
-        Self::validate_tags(&tags);
+        let normalized_tags = Self::validate_and_normalize_tags(&env, &tags);
         Self::extend_instance_ttl(&env);
 
         let mut goals: Map<u32, SavingsGoal> = env
@@ -516,14 +500,20 @@ impl SavingsGoalContract {
             .get(&symbol_short!("GOALS"))
             .unwrap_or_else(|| Map::new(&env));
 
-        let mut goal = goals.get(goal_id).expect("Goal not found");
+        let mut goal = match goals.get(goal_id) {
+            Some(g) => g,
+            None => {
+                Self::append_audit(&env, symbol_short!("add_tags"), &caller, false);
+                panic!("Goal not found");
+            }
+        };
 
         if goal.owner != caller {
             Self::append_audit(&env, symbol_short!("add_tags"), &caller, false);
             panic!("Only the goal owner can add tags");
         }
 
-        for tag in tags.iter() {
+        for tag in normalized_tags.iter() {
             goal.tags.push_back(tag);
         }
 
@@ -539,6 +529,10 @@ impl SavingsGoalContract {
             symbol_short!("tags_add"),
             (goal_id, caller.clone(), tags.clone()),
         );
+        env.events().publish(
+            (symbol_short!("savings"), symbol_short!("tags_add")),
+            (goal_id, caller.clone(), tags.clone()),
+        );
 
         Self::append_audit(&env, symbol_short!("add_tags"), &caller, true);
     }
@@ -552,14 +546,9 @@ impl SavingsGoalContract {
     /// Notes:
     /// - Removing a tag that is not present is a no-op.
     /// - Emits `(savings, tags_rem)` with `(goal_id, caller, tags)`.
-    pub fn remove_tags_from_goal(
-        env: Env,
-        caller: Address,
-        goal_id: u32,
-        tags: Vec<String>,
-    ) {
+    pub fn remove_tags_from_goal(env: Env, caller: Address, goal_id: u32, tags: Vec<String>) {
         caller.require_auth();
-        Self::validate_tags(&tags);
+        let normalized_tags = Self::validate_and_normalize_tags(&env, &tags);
         Self::extend_instance_ttl(&env);
 
         let mut goals: Map<u32, SavingsGoal> = env
@@ -568,7 +557,13 @@ impl SavingsGoalContract {
             .get(&symbol_short!("GOALS"))
             .unwrap_or_else(|| Map::new(&env));
 
-        let mut goal = goals.get(goal_id).expect("Goal not found");
+        let mut goal = match goals.get(goal_id) {
+            Some(g) => g,
+            None => {
+                Self::append_audit(&env, symbol_short!("rem_tags"), &caller, false);
+                panic!("Goal not found");
+            }
+        };
 
         if goal.owner != caller {
             Self::append_audit(&env, symbol_short!("rem_tags"), &caller, false);
@@ -578,7 +573,7 @@ impl SavingsGoalContract {
         let mut new_tags = Vec::new(&env);
         for existing_tag in goal.tags.iter() {
             let mut should_keep = true;
-            for remove_tag in tags.iter() {
+            for remove_tag in normalized_tags.iter() {
                 if existing_tag == remove_tag {
                     should_keep = false;
                     break;
@@ -602,6 +597,10 @@ impl SavingsGoalContract {
             symbol_short!("tags_rem"),
             (goal_id, caller.clone(), tags.clone()),
         );
+        env.events().publish(
+            (symbol_short!("savings"), symbol_short!("tags_rem")),
+            (goal_id, caller.clone(), tags.clone()),
+        );
 
         Self::append_audit(&env, symbol_short!("rem_tags"), &caller, true);
     }
@@ -620,7 +619,6 @@ impl SavingsGoalContract {
     ///   goals should validate this before invoking the contract.
     ///
     /// # Events
-    /// - Emits `GOAL_CREATED` with goal details.
     /// - Emits `SavingsEvent::GoalCreated`.
     pub fn create_goal(
         env: Env,
@@ -675,16 +673,22 @@ impl SavingsGoalContract {
 
         let event = GoalCreatedEvent {
             goal_id: next_id,
+            owner: owner.clone(),
             name: goal.name.clone(),
             target_amount,
             target_date,
             timestamp: env.ledger().timestamp(),
         };
+        env.events().publish((GOAL_CREATED,), event.clone());
+        env.events().publish(
+            (symbol_short!("savings"), SavingsEvent::GoalCreated),
+            (next_id, owner.clone()),
+        );
         RemitwiseEvents::emit(
             &env,
             EventCategory::State,
             EventPriority::Medium,
-            symbol_short!("created"),
+            GOAL_CREATED,
             event,
         );
         RemitwiseEvents::emit(
@@ -749,7 +753,7 @@ impl SavingsGoalContract {
         // Access control: verify caller is the owner
         if goal.owner != caller {
             Self::append_audit(&env, symbol_short!("add"), &caller, false);
-            panic!("Only the goal owner can add funds");
+            return Err(SavingsGoalsError::Unauthorized);
         }
 
         goal.current_amount = goal
@@ -767,15 +771,23 @@ impl SavingsGoalContract {
 
         let funds_event = FundsAddedEvent {
             goal_id,
+            owner: caller.clone(),
             amount,
             new_total,
             timestamp: env.ledger().timestamp(),
         };
-        RemitwiseEvents::emit(&env, EventCategory::Transaction, EventPriority::Medium, symbol_short!("funds_add"), funds_event);
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::Transaction,
+            EventPriority::Medium,
+            symbol_short!("funds_add"),
+            funds_event,
+        );
 
         if was_completed && !previously_completed {
             let completed_event = GoalCompletedEvent {
                 goal_id,
+                owner: caller.clone(),
                 name: goal.name.clone(),
                 final_amount: new_total,
                 timestamp: env.ledger().timestamp(),
@@ -841,16 +853,17 @@ impl SavingsGoalContract {
             if goal.owner != caller {
                 return Err(SavingsGoalsError::Unauthorized);
             }
-            goal.current_amount = match goal.current_amount.checked_add(item.amount) {
-                Some(v) => v,
-                None => panic!("overflow"),
-            };
+            goal.current_amount = goal
+                .current_amount
+                .checked_add(item.amount)
+                .ok_or(SavingsGoalsError::Overflow)?;
             let new_total = goal.current_amount;
             let was_completed = new_total >= goal.target_amount;
             let previously_completed = (new_total - item.amount) >= goal.target_amount;
             goals.set(item.goal_id, goal.clone());
             let funds_event = FundsAddedEvent {
                 goal_id: item.goal_id,
+                owner: caller.clone(),
                 amount: item.amount,
                 new_total,
                 timestamp: env.ledger().timestamp(),
@@ -865,6 +878,7 @@ impl SavingsGoalContract {
             if was_completed && !previously_completed {
                 let completed_event = GoalCompletedEvent {
                     goal_id: item.goal_id,
+                    owner: caller.clone(),
                     name: goal.name.clone(),
                     final_amount: new_total,
                     timestamp: env.ledger().timestamp(),
@@ -1002,6 +1016,21 @@ impl SavingsGoalContract {
         env.storage()
             .instance()
             .set(&symbol_short!("GOALS"), &goals);
+
+        let withdraw_event = FundsWithdrawnEvent {
+            goal_id,
+            owner: caller.clone(),
+            amount,
+            new_total: new_amount,
+            timestamp: env.ledger().timestamp(),
+        };
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::Transaction,
+            EventPriority::Medium,
+            symbol_short!("funds_rem"),
+            withdraw_event,
+        );
 
         Self::append_audit(&env, symbol_short!("withdraw"), &caller, true);
         env.events().publish(
@@ -1294,7 +1323,6 @@ impl SavingsGoalContract {
         snapshot: GoalsExportSnapshot,
     ) -> Result<bool, SavingsGoalError> {
         caller.require_auth();
-        Self::require_nonce(&env, &caller, nonce);
 
         // Accept any schema_version within the supported range for backward/forward compat.
         if snapshot.schema_version < MIN_SUPPORTED_SCHEMA_VERSION
@@ -1312,6 +1340,8 @@ impl SavingsGoalContract {
             Self::append_audit(&env, symbol_short!("import"), &caller, false);
             return Err(SavingsGoalError::ChecksumMismatch);
         }
+
+        Self::require_nonce(&env, &caller, nonce);
 
         Self::extend_instance_ttl(&env);
         let mut goals: Map<u32, SavingsGoal> = Map::new(&env);
@@ -1613,7 +1643,10 @@ impl SavingsGoalContract {
             .get(&symbol_short!("SAV_SCH"))
             .unwrap_or_else(|| Map::new(&env));
 
-        let mut schedule = schedules.get(schedule_id).expect("Schedule not found");
+        let mut schedule = match schedules.get(schedule_id) {
+            Some(s) => s,
+            None => panic!("Schedule not found"),
+        };
 
         if schedule.owner != caller {
             panic!("Only the schedule owner can modify it");
@@ -1648,7 +1681,10 @@ impl SavingsGoalContract {
             .get(&symbol_short!("SAV_SCH"))
             .unwrap_or_else(|| Map::new(&env));
 
-        let mut schedule = schedules.get(schedule_id).expect("Schedule not found");
+        let mut schedule = match schedules.get(schedule_id) {
+            Some(s) => s,
+            None => panic!("Schedule not found"),
+        };
 
         if schedule.owner != caller {
             panic!("Only the schedule owner can cancel it");
@@ -1831,5 +1867,7 @@ impl SavingsGoalContract {
 // -----------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------
+#[cfg(test)]
+mod event_test;
 #[cfg(test)]
 mod test;
