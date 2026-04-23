@@ -460,6 +460,9 @@ pub fn export_to_encrypted_payload(plain_bytes: &[u8]) -> Result<String, Migrati
 
 /// Decode encrypted payload from prefixed base64.
 pub fn import_from_encrypted_payload(encoded: &str) -> Result<Vec<u8>, MigrationError> {
+    // Pre-deserialization check: Ensure the base64-encoded string does not exceed
+    // MAX_ENCRYPTED_PAYLOAD_BYTES to prevent DoS from oversized requests before decoding.
+    // The decoded payload's size is checked against MAX_MIGRATION_PAYLOAD_BYTES later.
     validate_encrypted_payload_size(encoded.len())?;
 
     let rest = encoded
@@ -495,6 +498,10 @@ pub fn import_from_json(
     tracker: &mut MigrationTracker,
     timestamp_ms: u64,
 ) -> Result<ExportSnapshot, MigrationError> {
+    // Pre-deserialization check: Ensure the raw JSON snapshot envelope does not exceed
+    // MAX_MIGRATION_SNAPSHOT_BYTES to prevent DoS from oversized requests before parsing.
+    // Logical payload size (MAX_MIGRATION_PAYLOAD_BYTES) and record count (MAX_MIGRATION_RECORDS)
+    // are validated post-deserialization as part of `snapshot.validate_for_import()`.
     validate_snapshot_size(bytes.len())?;
     let snapshot: ExportSnapshot = serde_json::from_slice(bytes)
         .map_err(|e| MigrationError::DeserializeError(e.to_string()))?;
@@ -509,6 +516,10 @@ pub fn import_from_binary(
     tracker: &mut MigrationTracker,
     timestamp_ms: u64,
 ) -> Result<ExportSnapshot, MigrationError> {
+    // Pre-deserialization check: Ensure the raw binary snapshot envelope does not exceed
+    // MAX_MIGRATION_SNAPSHOT_BYTES to prevent DoS from oversized requests before parsing.
+    // Logical payload size (MAX_MIGRATION_PAYLOAD_BYTES) and record count (MAX_MIGRATION_RECORDS)
+    // are validated post-deserialization as part of `snapshot.validate_for_import()`.
     validate_snapshot_size(bytes.len())?;
     let snapshot: ExportSnapshot =
         bincode::deserialize(bytes).map_err(|e| MigrationError::DeserializeError(e.to_string()))?;
@@ -531,6 +542,9 @@ pub fn import_from_binary_untracked(bytes: &[u8]) -> Result<ExportSnapshot, Migr
 
 /// Import goals from CSV into SavingsGoalsExport.
 pub fn import_goals_from_csv(bytes: &[u8]) -> Result<Vec<SavingsGoalExport>, MigrationError> {
+    // Pre-deserialization check: Ensure the raw CSV input bytes do not exceed
+    // MAX_MIGRATION_PAYLOAD_BYTES to prevent DoS from oversized requests before parsing.
+    // Logical record count (MAX_MIGRATION_RECORDS) is validated during iteration.
     if bytes.len() > MAX_MIGRATION_PAYLOAD_BYTES {
         return Err(MigrationError::PayloadTooLarge {
             size: bytes.len(),
