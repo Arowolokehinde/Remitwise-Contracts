@@ -2177,3 +2177,73 @@ fn test_get_stored_report_missing_key_returns_none() {
         "missing report must return None, not panic"
     );
 }
+
+#[test]
+fn test_check_dependencies_succeeds_with_configured_contracts() {
+    let env = create_test_env();
+    let contract_id = env.register_contract(None, ReportingContract);
+    let client = ReportingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    // Register mock contracts
+    let remittance_split_id = env.register_contract(None, remittance_split::RemittanceSplit);
+    let savings_goals_id = env.register_contract(None, savings_goals::SavingsGoalsContract);
+    let bill_payments_id = env.register_contract(None, bill_payments::BillPayments);
+    let insurance_id = env.register_contract(None, insurance::Insurance);
+    let family_wallet = Address::generate(&env); // Not a contract, just an address
+
+    client.configure_addresses(
+        &admin,
+        &Address::from_contract_id(&env, &remittance_split_id),
+        &Address::from_contract_id(&env, &savings_goals_id),
+        &Address::from_contract_id(&env, &bill_payments_id),
+        &Address::from_contract_id(&env, &insurance_id),
+        &family_wallet,
+    );
+
+    let statuses = client.check_dependencies(&admin).unwrap();
+    assert_eq!(statuses.len(), 5);
+
+    // Check each status
+    assert_eq!(statuses.get(0).unwrap().name, "remittance_split");
+    assert!(statuses.get(0).unwrap().ok);
+    assert_eq!(statuses.get(0).unwrap().error_category, None);
+
+    assert_eq!(statuses.get(1).unwrap().name, "savings_goals");
+    assert!(statuses.get(1).unwrap().ok);
+
+    assert_eq!(statuses.get(2).unwrap().name, "bill_payments");
+    assert!(statuses.get(2).unwrap().ok);
+
+    assert_eq!(statuses.get(3).unwrap().name, "insurance");
+    assert!(statuses.get(3).unwrap().ok);
+
+    assert_eq!(statuses.get(4).unwrap().name, "family_wallet");
+    assert!(statuses.get(4).unwrap().ok);
+}
+
+#[test]
+fn test_check_dependencies_fails_for_non_admin() {
+    let env = create_test_env();
+    let contract_id = env.register_contract(None, ReportingContract);
+    let client = ReportingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let non_admin = Address::generate(&env);
+    client.init(&admin);
+
+    let result = client.try_check_dependencies(&non_admin);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_check_dependencies_fails_when_not_configured() {
+    let env = create_test_env();
+    let contract_id = env.register_contract(None, ReportingContract);
+    let client = ReportingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    let result = client.try_check_dependencies(&admin);
+    assert!(result.is_err());
+}
