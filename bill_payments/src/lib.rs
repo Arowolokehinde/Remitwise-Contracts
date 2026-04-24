@@ -146,6 +146,7 @@ pub enum BillEvent {
     ScheduleMissed,
     ScheduleModified,
     ScheduleCancelled,
+    RecurringBillCreated,
 }
 
 #[derive(Clone, Debug)]
@@ -606,6 +607,7 @@ impl BillPayments {
 
         let current_time = env.ledger().timestamp();
         let bill_external_ref = external_ref.clone();
+        let schedule_id = if recurring { Some(next_id) } else { None };
         let bill = Bill {
             id: next_id,
             owner: owner.clone(),
@@ -618,7 +620,7 @@ impl BillPayments {
             paid: false,
             created_at: current_time,
             paid_at: None,
-            schedule_id: None,
+            schedule_id,
             tags: Vec::new(&env),
             currency: resolved_currency,
         };
@@ -710,6 +712,19 @@ impl BillPayments {
             env.storage()
                 .instance()
                 .set(&symbol_short!("NEXT_ID"), &next_id);
+
+            // Emit event for the new recurring bill
+            env.events().publish(
+                (symbol_short!("bill"), BillEvent::RecurringBillCreated),
+                (next_id, bill.owner.clone(), bill.external_ref.clone()),
+            );
+            RemitwiseEvents::emit(
+                &env,
+                EventCategory::State,
+                EventPriority::Medium,
+                symbol_short!("recurring_created"),
+                (next_id, bill.owner.clone(), bill.amount, next_due_date),
+            );
         }
 
         let paid_amount = bill.amount;
