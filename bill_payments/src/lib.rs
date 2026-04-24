@@ -18,6 +18,17 @@ const SECONDS_PER_DAY: u64 = 86_400;
 /// Maximum length for currency codes (ISO 4217 is 3 letters)
 const MAX_CURRENCY_LEN: u32 = 10;
 
+/// Maximum number of active bills a single owner may hold at one time.
+/// Enforced on create_bill (and on the recurring-bill spawn inside pay_bill /
+/// batch_pay_bills).  Archived bills do NOT count toward this cap.
+pub const MAX_BILLS_PER_OWNER: u32 = 1_000;
+
+/// Storage key for the active-bill owner index: Map<Address, Vec<u32>>
+const STORAGE_OWNER_INDEX: soroban_sdk::Symbol = symbol_short!("OWN_IDX");
+
+/// Storage key for the archived-bill owner index: Map<Address, Vec<u32>>
+const STORAGE_ARCH_INDEX: soroban_sdk::Symbol = symbol_short!("OWN_ARCH");
+
 /// Validates that a currency string contains only ASCII alphabetic characters.
 /// Returns true if the string is valid (all ASCII letters A-Z or a-z).
 fn is_valid_currency_chars(s: &[u8]) -> bool {
@@ -102,6 +113,8 @@ pub enum BillPaymentsError {
     EmptyTags = 14,
     /// Currency code is invalid (empty, too long, or contains non-alphanumeric)
     InvalidCurrency = 15,
+    /// Owner has reached the per-owner bill cap (MAX_BILLS_PER_OWNER)
+    OwnerBillCapExceeded = 16,
 }
 
 // Back-compat alias: large parts of this crate (and tests) still refer to `Error`.
@@ -163,6 +176,101 @@ pub struct BillPayments;
 
 #[contractimpl]
 impl BillPayments {
+    // -----------------------------------------------------------------------
+    // Owner-index helpers
+    // -----------------------------------------------------------------------
+
+    /// Return the active-bill ID list for `owner` (ID-ascending, no gaps).
+    fn get_owner_bills(env: &Env, owner: &Address) -> Vec<u32> {
+        let idx: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&STORAGE_OWNER_INDEX)
+            .unwrap_or_else(|| Map::new(env));
+        idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Return the archived-bill ID list for `owner`.
+    fn get_owner_archived_bills(env: &Env, owner: &Address) -> Vec<u32> {
+        let idx: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&STORAGE_ARCH_INDEX)
+            .unwrap_or_else(|| Map::new(env));
+        idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env))
+    }
+
+    /// Append `bill_id` to the active index for `owner`.
+    /// IDs are appended in creation order, which is ID-ascending by construction.
+    fn index_add_active(env: &Env, owner: &Address, bill_id: u32) {
+        let mut idx: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&STORAGE_OWNER_INDEX)
+            .unwrap_or_else(|| Map::new(env));
+        let mut ids = idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env));
+        ids.push_back(bill_id);
+        idx.set(owner.clone(), ids);
+        env.storage()
+            .instance()
+            .set(&STORAGE_OWNER_INDEX, &idx);
+    }
+
+    /// Remove `bill_id` from the active index for `owner`.
+    fn index_remove_active(env: &Env, owner: &Address, bill_id: u32) {
+        let mut idx: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&STORAGE_OWNER_INDEX)
+            .unwrap_or_else(|| Map::new(env));
+        let ids = idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env));
+        let mut new_ids: Vec<u32> = Vec::new(env);
+        for id in ids.iter() {
+            if id != bill_id {
+                new_ids.push_back(id);
+            }
+        }
+        idx.set(owner.clone(), new_ids);
+        env.storage()
+            .instance()
+            .set(&STORAGE_OWNER_INDEX, &idx);
+    }
+
+    /// Append `bill_id` to the archived index for `owner`.
+    fn index_add_archived(env: &Env, owner: &Address, bill_id: u32) {
+        let mut idx: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&STORAGE_ARCH_INDEX)
+            .unwrap_or_else(|| Map::new(env));
+        let mut ids = idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env));
+        ids.push_back(bill_id);
+        idx.set(owner.clone(), ids);
+        env.storage()
+            .instance()
+            .set(&STORAGE_ARCH_INDEX, &idx);
+    }
+
+    /// Remove `bill_id` from the archived index for `owner`.
+    fn index_remove_archived(env: &Env, owner: &Address, bill_id: u32) {
+        let mut idx: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&STORAGE_ARCH_INDEX)
+            .unwrap_or_else(|| Map::new(env));
+        let ids = idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env));
+        let mut new_ids: Vec<u32> = Vec::new(env);
+        for id in ids.iter() {
+            if id != bill_id {
+                new_ids.push_back(id);
+            }
+        }
+        idx.set(owner.clone(), new_ids);
+        env.storage()
+            .instance()
+            .set(&STORAGE_ARCH_INDEX, &idx);
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
@@ -591,6 +699,13 @@ impl BillPayments {
             Self::validate_and_normalize_currency(&env, &currency)?;
 
         Self::extend_instance_ttl(&env);
+
+        // Enforce per-owner bill cap before touching storage.
+        let owner_bill_count = Self::get_owner_bills(&env, &owner).len();
+        if owner_bill_count >= MAX_BILLS_PER_OWNER {
+            return Err(BillPaymentsError::OwnerBillCapExceeded);
+        }
+
         let mut bills: Map<u32, Bill> = env
             .storage()
             .instance()
@@ -631,6 +746,8 @@ impl BillPayments {
         env.storage()
             .instance()
             .set(&symbol_short!("NEXT_ID"), &next_id);
+        // Update owner index
+        Self::index_add_active(&env, &bill_owner, next_id);
         Self::adjust_unpaid_total(&env, &bill_owner, amount);
 
         // Emit event for audit trail
@@ -710,6 +827,8 @@ impl BillPayments {
             env.storage()
                 .instance()
                 .set(&symbol_short!("NEXT_ID"), &next_id);
+            // Update owner index for the newly created recurring bill
+            Self::index_add_active(&env, &caller, next_id);
         }
 
         let paid_amount = bill.amount;
@@ -747,6 +866,14 @@ impl BillPayments {
         bills.get(bill_id)
     }
 
+    /// Return the number of active (non-archived) bills owned by `owner`.
+    ///
+    /// This is an O(1) read from the owner index and does not scan the full
+    /// bill map.  The count is bounded by `MAX_BILLS_PER_OWNER`.
+    pub fn get_owner_bill_count(env: Env, owner: Address) -> u32 {
+        Self::get_owner_bills(&env, &owner).len()
+    }
+
     // -----------------------------------------------------------------------
     // PAGINATED LIST QUERIES
     // -----------------------------------------------------------------------
@@ -772,14 +899,19 @@ impl BillPayments {
             .instance()
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
-        let max_id = Self::get_next_bill_id(&env);
+
+        // Use the owner index for O(owner_bills) traversal instead of O(NEXT_ID).
+        let owner_ids = Self::get_owner_bills(&env, &owner);
 
         let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
-        for id in (cursor.saturating_add(1))..=max_id {
+        for id in owner_ids.iter() {
+            if id <= cursor {
+                continue;
+            }
             let Some(bill) = bills.get(id) else {
                 continue;
             };
-            if bill.owner != owner || bill.paid {
+            if bill.paid {
                 continue;
             }
             staging.push_back((id, bill));
@@ -806,16 +938,18 @@ impl BillPayments {
             .instance()
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
-        let max_id = Self::get_next_bill_id(&env);
+
+        // Use the owner index for O(owner_bills) traversal instead of O(NEXT_ID).
+        let owner_ids = Self::get_owner_bills(&env, &owner);
 
         let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
-        for id in (cursor.saturating_add(1))..=max_id {
+        for id in owner_ids.iter() {
+            if id <= cursor {
+                continue;
+            }
             let Some(bill) = bills.get(id) else {
                 continue;
             };
-            if bill.owner != owner {
-                continue;
-            }
             staging.push_back((id, bill));
             if staging.len() > limit {
                 break;
@@ -1066,16 +1200,18 @@ impl BillPayments {
             .instance()
             .get(&symbol_short!("ARCH_BILL"))
             .unwrap_or_else(|| Map::new(&env));
-        let max_id = Self::get_next_bill_id(&env);
+
+        // Use the archived owner index for O(owner_archived) traversal.
+        let owner_ids = Self::get_owner_archived_bills(&env, &owner);
 
         let mut staging: Vec<(u32, ArchivedBill)> = Vec::new(&env);
-        for id in (cursor.saturating_add(1))..=max_id {
+        for id in owner_ids.iter() {
+            if id <= cursor {
+                continue;
+            }
             let Some(bill) = archived.get(id) else {
                 continue;
             };
-            if bill.owner != owner {
-                continue;
-            }
             staging.push_back((id, bill));
             if staging.len() > limit {
                 break;
@@ -1143,6 +1279,8 @@ impl BillPayments {
         if removed_unpaid_amount > 0 {
             Self::adjust_unpaid_total(&env, &caller, -removed_unpaid_amount);
         }
+        // Remove from owner index
+        Self::index_remove_active(&env, &caller, bill_id);
         RemitwiseEvents::emit(
             &env,
             EventCategory::State,
@@ -1217,6 +1355,15 @@ impl BillPayments {
             .instance()
             .set(&symbol_short!("ARCH_BILL"), &archived);
 
+        // Update owner indexes: move archived IDs from active → archived index.
+        // We iterate the archived map to find owner per ID.
+        for id in to_remove.iter() {
+            if let Some(bill) = archived.get(id) {
+                Self::index_remove_active(&env, &bill.owner, id);
+                Self::index_add_archived(&env, &bill.owner, id);
+            }
+        }
+
         Self::extend_archive_ttl(&env);
         Self::update_storage_stats(&env);
 
@@ -1281,6 +1428,10 @@ impl BillPayments {
             .instance()
             .set(&symbol_short!("ARCH_BILL"), &archived);
 
+        // Update owner indexes: move from archived → active
+        Self::index_remove_archived(&env, &caller, bill_id);
+        Self::index_add_active(&env, &caller, bill_id);
+
         Self::update_storage_stats(&env);
 
         RemitwiseEvents::emit(
@@ -1314,17 +1465,19 @@ impl BillPayments {
             .get(&symbol_short!("ARCH_BILL"))
             .unwrap_or_else(|| Map::new(&env));
         let mut deleted_count = 0u32;
-        let mut to_remove: Vec<u32> = Vec::new(&env);
+        // Collect (id, owner) pairs so we can update the index after removal.
+        let mut to_remove: Vec<(u32, Address)> = Vec::new(&env);
 
         for (id, bill) in archived.iter() {
             if bill.archived_at < before_timestamp {
-                to_remove.push_back(id);
+                to_remove.push_back((id, bill.owner.clone()));
                 deleted_count += 1;
             }
         }
 
-        for id in to_remove.iter() {
+        for (id, owner) in to_remove.iter() {
             archived.remove(id);
+            Self::index_remove_archived(&env, &owner, id);
         }
 
         env.storage()
@@ -1452,6 +1605,8 @@ impl BillPayments {
                     currency: bill.currency.clone(),
                 };
                 bills.set(next_id, next_bill);
+                // Update owner index for the newly spawned recurring bill
+                Self::index_add_active(&env, &caller, next_id);
             } else {
                 unpaid_delta = unpaid_delta.saturating_sub(amount);
             }
@@ -1572,14 +1727,18 @@ impl BillPayments {
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
 
-        let max_id = Self::get_next_bill_id(&env);
+        // Use the owner index for O(owner_bills) traversal instead of O(NEXT_ID).
+        let owner_ids = Self::get_owner_bills(&env, &owner);
 
         let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
-        for id in (cursor.saturating_add(1))..=max_id {
+        for id in owner_ids.iter() {
+            if id <= cursor {
+                continue;
+            }
             let Some(bill) = bills.get(id) else {
                 continue;
             };
-            if bill.owner != owner || bill.currency != normalized_currency {
+            if bill.currency != normalized_currency {
                 continue;
             }
             staging.push_back((id, bill));
@@ -1630,14 +1789,20 @@ impl BillPayments {
             .get(&symbol_short!("BILLS"))
             .unwrap_or_else(|| Map::new(&env));
 
-        let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
         let normalized_currency = Self::normalize_currency(&env, &currency);
-        let max_id = Self::get_next_bill_id(&env);
-        for id in (cursor.saturating_add(1))..=max_id {
+
+        // Use the owner index for O(owner_bills) traversal instead of O(NEXT_ID).
+        let owner_ids = Self::get_owner_bills(&env, &owner);
+
+        let mut staging: Vec<(u32, Bill)> = Vec::new(&env);
+        for id in owner_ids.iter() {
+            if id <= cursor {
+                continue;
+            }
             let Some(bill) = bills.get(id) else {
                 continue;
             };
-            if bill.owner != owner || bill.paid || bill.currency != normalized_currency {
+            if bill.paid || bill.currency != normalized_currency {
                 continue;
             }
             staging.push_back((id, bill));
@@ -3617,5 +3782,592 @@ mod test {
         let admin = Address::generate(&env);
 
         client.bulk_cleanup_bills(&admin, &1000000);
+    }
+
+    // -----------------------------------------------------------------------
+    // SC-062: Per-owner bill caps and owner-indexed pagination tests
+    // -----------------------------------------------------------------------
+
+    /// Verify that creating exactly MAX_BILLS_PER_OWNER bills succeeds.
+    #[test]
+    fn test_owner_bill_cap_at_limit_succeeds() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        // Create MAX_BILLS_PER_OWNER bills — all should succeed
+        for i in 0..MAX_BILLS_PER_OWNER {
+            let result = client.try_create_bill(
+                &owner,
+                &String::from_str(&env, "Cap Test"),
+                &100,
+                &(env.ledger().timestamp() + 86400 * (i as u64 + 1)),
+                &false,
+                &0,
+                &None,
+                &String::from_str(&env, "XLM"),
+            );
+            assert!(result.is_ok(), "Bill {} should succeed", i + 1);
+        }
+
+        assert_eq!(client.get_owner_bill_count(&owner), MAX_BILLS_PER_OWNER);
+    }
+
+    /// Verify that creating MAX_BILLS_PER_OWNER + 1 bills fails with OwnerBillCapExceeded.
+    #[test]
+    fn test_owner_bill_cap_exceeded_fails() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        // Fill up to the cap
+        for i in 0..MAX_BILLS_PER_OWNER {
+            client.create_bill(
+                &owner,
+                &String::from_str(&env, "Cap Test"),
+                &100,
+                &(env.ledger().timestamp() + 86400 * (i as u64 + 1)),
+                &false,
+                &0,
+                &None,
+                &String::from_str(&env, "XLM"),
+            );
+        }
+
+        // One more should fail
+        let result = client.try_create_bill(
+            &owner,
+            &String::from_str(&env, "Over Cap"),
+            &100,
+            &(env.ledger().timestamp() + 86400 * (MAX_BILLS_PER_OWNER as u64 + 1)),
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+        assert_eq!(result, Err(Ok(BillPaymentsError::OwnerBillCapExceeded)));
+    }
+
+    /// Verify that cancelling a bill frees up a slot so a new bill can be created.
+    #[test]
+    fn test_owner_bill_cap_freed_after_cancel() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        // Create 5 bills
+        let ids = setup_bills(&env, &client, &owner, 5);
+        assert_eq!(client.get_owner_bill_count(&owner), 5);
+
+        // Cancel one
+        client.cancel_bill(&owner, &ids.get(0).unwrap());
+        assert_eq!(client.get_owner_bill_count(&owner), 4);
+
+        // Should be able to create another
+        let result = client.try_create_bill(
+            &owner,
+            &String::from_str(&env, "New Bill"),
+            &100,
+            &(env.ledger().timestamp() + 86400),
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+        assert!(result.is_ok(), "Should succeed after cancel freed a slot");
+        assert_eq!(client.get_owner_bill_count(&owner), 5);
+    }
+
+    /// Verify that archiving bills frees up slots (archived bills don't count toward cap).
+    #[test]
+    fn test_owner_bill_cap_freed_after_archive() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        // Create 5 bills, pay them all
+        let ids = setup_bills(&env, &client, &owner, 5);
+        for id in ids.iter() {
+            client.pay_bill(&owner, &id);
+        }
+        assert_eq!(client.get_owner_bill_count(&owner), 5);
+
+        // Archive them
+        client.archive_paid_bills(&owner, &u64::MAX);
+        assert_eq!(client.get_owner_bill_count(&owner), 0);
+
+        // Should be able to create new bills
+        let result = client.try_create_bill(
+            &owner,
+            &String::from_str(&env, "Post-Archive"),
+            &100,
+            &(env.ledger().timestamp() + 86400),
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+        assert!(result.is_ok());
+    }
+
+    /// Verify that restoring a bill increments the active count.
+    #[test]
+    fn test_owner_bill_count_after_restore() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        let ids = setup_bills(&env, &client, &owner, 3);
+        for id in ids.iter() {
+            client.pay_bill(&owner, &id);
+        }
+        client.archive_paid_bills(&owner, &u64::MAX);
+        assert_eq!(client.get_owner_bill_count(&owner), 0);
+
+        // Restore one
+        let first_id = ids.get(0).unwrap();
+        client.restore_bill(&owner, &first_id);
+        assert_eq!(client.get_owner_bill_count(&owner), 1);
+    }
+
+    /// Verify get_owner_bill_count is O(1) and returns correct count.
+    #[test]
+    fn test_get_owner_bill_count_basic() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        assert_eq!(client.get_owner_bill_count(&owner), 0);
+        setup_bills(&env, &client, &owner, 7);
+        assert_eq!(client.get_owner_bill_count(&owner), 7);
+    }
+
+    /// Verify cap is per-owner: one owner at cap doesn't affect another.
+    #[test]
+    fn test_owner_bill_cap_is_per_owner() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+
+        // owner_a creates 5 bills
+        setup_bills(&env, &client, &owner_a, 5);
+        assert_eq!(client.get_owner_bill_count(&owner_a), 5);
+
+        // owner_b can still create bills independently
+        let result = client.try_create_bill(
+            &owner_b,
+            &String::from_str(&env, "B Bill"),
+            &100,
+            &(env.ledger().timestamp() + 86400),
+            &false,
+            &0,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+        assert!(result.is_ok(), "owner_b should not be affected by owner_a's count");
+        assert_eq!(client.get_owner_bill_count(&owner_b), 1);
+    }
+
+    /// Verify index-based pagination returns same results as the old scan-based approach.
+    #[test]
+    fn test_index_pagination_matches_expected_ids() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+
+        // Interleave bills from two owners
+        for i in 0..5u32 {
+            client.create_bill(
+                &owner_a,
+                &String::from_str(&env, "A"),
+                &100,
+                &(env.ledger().timestamp() + 86400 * (i as u64 + 1)),
+                &false,
+                &0,
+                &None,
+                &String::from_str(&env, "XLM"),
+            );
+            client.create_bill(
+                &owner_b,
+                &String::from_str(&env, "B"),
+                &200,
+                &(env.ledger().timestamp() + 86400 * (i as u64 + 1)),
+                &false,
+                &0,
+                &None,
+                &String::from_str(&env, "XLM"),
+            );
+        }
+
+        // owner_a's bills should be IDs 1, 3, 5, 7, 9
+        let mut all_a: Vec<u32> = Vec::new(&env);
+        let mut cursor = 0u32;
+        loop {
+            let page = client.get_unpaid_bills(&owner_a, &cursor, &2);
+            for bill in page.items.iter() {
+                assert_eq!(bill.owner, owner_a, "Must only see owner_a bills");
+                all_a.push_back(bill.id);
+            }
+            if page.next_cursor == 0 {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        let expected_a = soroban_sdk::vec![&env, 1u32, 3u32, 5u32, 7u32, 9u32];
+        assert_eq!(all_a, expected_a);
+
+        // owner_b's bills should be IDs 2, 4, 6, 8, 10
+        let mut all_b: Vec<u32> = Vec::new(&env);
+        cursor = 0;
+        loop {
+            let page = client.get_unpaid_bills(&owner_b, &cursor, &2);
+            for bill in page.items.iter() {
+                assert_eq!(bill.owner, owner_b, "Must only see owner_b bills");
+                all_b.push_back(bill.id);
+            }
+            if page.next_cursor == 0 {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        let expected_b = soroban_sdk::vec![&env, 2u32, 4u32, 6u32, 8u32, 10u32];
+        assert_eq!(all_b, expected_b);
+    }
+
+    /// Verify index-based pagination for get_all_bills_for_owner.
+    #[test]
+    fn test_index_get_all_bills_for_owner_pagination() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        let ids = setup_bills(&env, &client, &owner, 6);
+        // Pay the 2nd and 4th bills
+        client.pay_bill(&owner, &ids.get(1).unwrap());
+        client.pay_bill(&owner, &ids.get(3).unwrap());
+
+        // get_all_bills_for_owner should return all 6 (paid + unpaid)
+        let mut all: Vec<u32> = Vec::new(&env);
+        let mut cursor = 0u32;
+        loop {
+            let page = client.get_all_bills_for_owner(&owner, &cursor, &2);
+            for bill in page.items.iter() {
+                all.push_back(bill.id);
+            }
+            if page.next_cursor == 0 {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        assert_eq!(all.len(), 6, "Should return all 6 bills");
+        // Verify ascending order
+        for i in 1..all.len() {
+            assert!(all.get(i as u32).unwrap() > all.get(i as u32 - 1).unwrap());
+        }
+    }
+
+    /// Verify index-based archived bill pagination.
+    #[test]
+    fn test_index_archived_bills_pagination() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+
+        // Create and pay bills for both owners
+        let ids_a = setup_bills(&env, &client, &owner_a, 4);
+        let ids_b = setup_bills(&env, &client, &owner_b, 3);
+
+        for id in ids_a.iter() {
+            client.pay_bill(&owner_a, &id);
+        }
+        for id in ids_b.iter() {
+            client.pay_bill(&owner_b, &id);
+        }
+
+        client.archive_paid_bills(&owner_a, &u64::MAX);
+
+        // owner_a should see 4 archived bills
+        let mut archived_a: Vec<u32> = Vec::new(&env);
+        let mut cursor = 0u32;
+        loop {
+            let page = client.get_archived_bills(&owner_a, &cursor, &2);
+            for bill in page.items.iter() {
+                assert_eq!(bill.owner, owner_a, "Must only see owner_a archived bills");
+                archived_a.push_back(bill.id);
+            }
+            if page.next_cursor == 0 {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        assert_eq!(archived_a.len(), 4);
+
+        // owner_b should see 3 archived bills
+        let mut archived_b: Vec<u32> = Vec::new(&env);
+        cursor = 0;
+        loop {
+            let page = client.get_archived_bills(&owner_b, &cursor, &2);
+            for bill in page.items.iter() {
+                assert_eq!(bill.owner, owner_b, "Must only see owner_b archived bills");
+                archived_b.push_back(bill.id);
+            }
+            if page.next_cursor == 0 {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        assert_eq!(archived_b.len(), 3);
+    }
+
+    /// Verify that bulk_cleanup_bills removes IDs from the archived index.
+    #[test]
+    fn test_index_cleanup_removes_from_archived_index() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        let ids = setup_bills(&env, &client, &owner, 4);
+        for id in ids.iter() {
+            client.pay_bill(&owner, &id);
+        }
+        client.archive_paid_bills(&owner, &u64::MAX);
+
+        // Verify 4 archived
+        let page = client.get_archived_bills(&owner, &0, &10);
+        assert_eq!(page.count, 4);
+
+        // Cleanup all
+        client.bulk_cleanup_bills(&owner, &u64::MAX);
+
+        // Archived index should now be empty
+        let page = client.get_archived_bills(&owner, &0, &10);
+        assert_eq!(page.count, 0, "Archived index should be empty after cleanup");
+    }
+
+    /// Verify that recurring bill spawns are tracked in the owner index.
+    #[test]
+    fn test_index_recurring_bill_spawn_tracked() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        // Create a recurring bill
+        let bill_id = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Recurring"),
+            &100,
+            &1_000_000,
+            &true,
+            &30,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+        assert_eq!(client.get_owner_bill_count(&owner), 1);
+
+        // Pay it — spawns a new bill
+        client.pay_bill(&owner, &bill_id);
+
+        // Count should be 2 (original paid + new spawned)
+        assert_eq!(client.get_owner_bill_count(&owner), 2);
+
+        // Both should appear in get_all_bills_for_owner
+        let page = client.get_all_bills_for_owner(&owner, &0, &10);
+        assert_eq!(page.count, 2);
+    }
+
+    /// Verify index ordering is ID-ascending (canonical ordering contract).
+    #[test]
+    fn test_index_ordering_is_id_ascending() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+
+        // Interleave bills
+        for i in 0..4u32 {
+            client.create_bill(
+                &owner_a,
+                &String::from_str(&env, "A"),
+                &100,
+                &(env.ledger().timestamp() + 86400 * (i as u64 + 1)),
+                &false,
+                &0,
+                &None,
+                &String::from_str(&env, "XLM"),
+            );
+            client.create_bill(
+                &owner_b,
+                &String::from_str(&env, "B"),
+                &100,
+                &(env.ledger().timestamp() + 86400 * (i as u64 + 1)),
+                &false,
+                &0,
+                &None,
+                &String::from_str(&env, "XLM"),
+            );
+        }
+
+        // Collect all IDs for owner_a via pagination
+        let mut last_id = 0u32;
+        let mut cursor = 0u32;
+        loop {
+            let page = client.get_unpaid_bills(&owner_a, &cursor, &2);
+            for bill in page.items.iter() {
+                assert!(
+                    bill.id > last_id,
+                    "IDs must be strictly ascending: got {} after {}",
+                    bill.id,
+                    last_id
+                );
+                last_id = bill.id;
+            }
+            if page.next_cursor == 0 {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+    }
+
+    /// Verify cursor stability: paginating with the same cursor twice returns the same results.
+    #[test]
+    fn test_index_cursor_stability() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        setup_bills(&env, &client, &owner, 10);
+
+        let page1_first = client.get_unpaid_bills(&owner, &0, &3);
+        let page1_second = client.get_unpaid_bills(&owner, &0, &3);
+
+        assert_eq!(page1_first.count, page1_second.count);
+        assert_eq!(page1_first.next_cursor, page1_second.next_cursor);
+        for i in 0..page1_first.count {
+            assert_eq!(
+                page1_first.items.get(i).unwrap().id,
+                page1_second.items.get(i).unwrap().id
+            );
+        }
+    }
+
+    /// Verify index-based get_bills_by_currency only returns matching currency.
+    #[test]
+    fn test_index_get_bills_by_currency_filtered() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        // Create 3 XLM and 2 USDC bills
+        for i in 0..3u32 {
+            client.create_bill(
+                &owner,
+                &String::from_str(&env, "XLM Bill"),
+                &100,
+                &(env.ledger().timestamp() + 86400 * (i as u64 + 1)),
+                &false,
+                &0,
+                &None,
+                &String::from_str(&env, "XLM"),
+            );
+        }
+        for i in 0..2u32 {
+            client.create_bill(
+                &owner,
+                &String::from_str(&env, "USDC Bill"),
+                &200,
+                &(env.ledger().timestamp() + 86400 * (i as u64 + 4)),
+                &false,
+                &0,
+                &None,
+                &String::from_str(&env, "USDC"),
+            );
+        }
+
+        let xlm_page = client.get_bills_by_currency(&owner, &String::from_str(&env, "XLM"), &0, &10);
+        assert_eq!(xlm_page.count, 3);
+        for bill in xlm_page.items.iter() {
+            assert_eq!(bill.currency, String::from_str(&env, "XLM"));
+        }
+
+        let usdc_page = client.get_bills_by_currency(&owner, &String::from_str(&env, "USDC"), &0, &10);
+        assert_eq!(usdc_page.count, 2);
+        for bill in usdc_page.items.iter() {
+            assert_eq!(bill.currency, String::from_str(&env, "USDC"));
+        }
+    }
+
+    /// Verify that batch_pay_bills updates the index for recurring bill spawns.
+    #[test]
+    fn test_index_batch_pay_recurring_updates_index() {
+        let env = make_env();
+        env.mock_all_auths();
+        let cid = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &cid);
+        let owner = Address::generate(&env);
+
+        // Create 2 recurring bills
+        let id1 = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Rec1"),
+            &100,
+            &1_000_000,
+            &true,
+            &30,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+        let id2 = client.create_bill(
+            &owner,
+            &String::from_str(&env, "Rec2"),
+            &200,
+            &1_000_000,
+            &true,
+            &30,
+            &None,
+            &String::from_str(&env, "XLM"),
+        );
+        assert_eq!(client.get_owner_bill_count(&owner), 2);
+
+        // Batch pay both
+        let mut ids = Vec::new(&env);
+        ids.push_back(id1);
+        ids.push_back(id2);
+        client.batch_pay_bills(&owner, &ids);
+
+        // Should now have 4 bills (2 paid + 2 spawned)
+        assert_eq!(client.get_owner_bill_count(&owner), 4);
     }
 }
