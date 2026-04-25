@@ -543,7 +543,7 @@ impl SavingsGoalContract {
                 }
                 if !((c >= b'a' && c <= b'z') || (c >= b'0' && c <= b'9') || c == b'-' || c == b'_')
                 {
-                    soroban_sdk::panic_with_error!(env, SavingsGoalsError::InvalidTagContent);
+                    soroban_sdk::panic_with_error!(env, SavingsGoalError::InvalidTagContent);
                 }
             }
             let tag_str = core::str::from_utf8(&buf[..len as usize]).unwrap_or("");
