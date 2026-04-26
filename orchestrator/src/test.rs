@@ -21,7 +21,7 @@ mod tests {
 
     fn register_orchestrator(env: &Env) -> OrchestratorClient<'_> {
         let contract_id = env.register_contract(None, Orchestrator);
-        OrchestratorClient::new(&env, &contract_id)
+        OrchestratorClient::new(env, &contract_id)
     }
 
     fn compute_test_hash(

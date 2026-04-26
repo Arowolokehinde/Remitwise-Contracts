@@ -252,31 +252,61 @@ impl BillPayments {
         env.storage().instance().set(&STORAGE_OWNER_INDEX, &idx);
     }
 
-    /// Insert `bill_id` into the archived index for `owner` in ascending order.
-    fn index_add_archived(env: &Env, owner: &Address, bill_id: u32) {
+    /// Remove multiple `bill_ids` from the active index for `owner`.
+    fn index_remove_active_batch(env: &Env, owner: &Address, bill_ids: &Vec<u32>) {
+        let mut idx: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&STORAGE_OWNER_INDEX)
+            .unwrap_or_else(|| Map::new(env));
+        let ids = idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env));
+        let mut new_ids: Vec<u32> = Vec::new(env);
+        for id in ids.iter() {
+            let mut removed = false;
+            for b_id in bill_ids.iter() {
+                if id == b_id {
+                    removed = true;
+                    break;
+                }
+            }
+            if !removed {
+                new_ids.push_back(id);
+            }
+        }
+        idx.set(owner.clone(), new_ids);
+        env.storage().instance().set(&STORAGE_OWNER_INDEX, &idx);
+    }
+
+    /// Add multiple `bill_ids` to the archived index for `owner`.
+    fn index_add_archived_batch(env: &Env, owner: &Address, bill_ids: &Vec<u32>) {
         let mut idx: Map<Address, Vec<u32>> = env
             .storage()
             .instance()
             .get(&STORAGE_ARCH_INDEX)
             .unwrap_or_else(|| Map::new(env));
-        let ids = idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env));
-        let mut new_ids: Vec<u32> = Vec::new(env);
-        let mut inserted = false;
-        for id in ids.iter() {
-            if !inserted {
-                if bill_id == id {
-                    inserted = true;
-                } else if bill_id < id {
-                    new_ids.push_back(bill_id);
-                    inserted = true;
+        let mut owner_ids = idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env));
+
+        for bill_id in bill_ids.iter() {
+            let mut new_ids: Vec<u32> = Vec::new(env);
+            let mut inserted = false;
+            for id in owner_ids.iter() {
+                if !inserted {
+                    if bill_id == id {
+                        inserted = true;
+                    } else if bill_id < id {
+                        new_ids.push_back(bill_id);
+                        inserted = true;
+                    }
                 }
+                new_ids.push_back(id);
             }
-            new_ids.push_back(id);
+            if !inserted {
+                new_ids.push_back(bill_id);
+            }
+            owner_ids = new_ids;
         }
-        if !inserted {
-            new_ids.push_back(bill_id);
-        }
-        idx.set(owner.clone(), new_ids);
+
+        idx.set(owner.clone(), owner_ids);
         env.storage().instance().set(&STORAGE_ARCH_INDEX, &idx);
     }
 
@@ -291,6 +321,31 @@ impl BillPayments {
         let mut new_ids: Vec<u32> = Vec::new(env);
         for id in ids.iter() {
             if id != bill_id {
+                new_ids.push_back(id);
+            }
+        }
+        idx.set(owner.clone(), new_ids);
+        env.storage().instance().set(&STORAGE_ARCH_INDEX, &idx);
+    }
+
+    /// Remove multiple `bill_ids` from the archived index for `owner`.
+    fn index_remove_archived_batch(env: &Env, owner: &Address, bill_ids: &Vec<u32>) {
+        let mut idx: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&STORAGE_ARCH_INDEX)
+            .unwrap_or_else(|| Map::new(env));
+        let ids = idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env));
+        let mut new_ids: Vec<u32> = Vec::new(env);
+        for id in ids.iter() {
+            let mut removed = false;
+            for b_id in bill_ids.iter() {
+                if id == b_id {
+                    removed = true;
+                    break;
+                }
+            }
+            if !removed {
                 new_ids.push_back(id);
             }
         }
@@ -386,7 +441,7 @@ impl BillPayments {
     ///
     /// Allowed characters: ASCII alphanumeric, hyphens, underscores, dots, colons.
     /// Length must be within `[MIN_EXTERNAL_REF_LEN, MAX_EXTERNAL_REF_LEN]`.
-    fn validate_external_ref(env: &Env, ext_ref: &String) -> Result<String, BillPaymentsError> {
+    fn validate_external_ref(_env: &Env, ext_ref: &String) -> Result<String, BillPaymentsError> {
         let len = ext_ref.len();
         if len < MIN_EXTERNAL_REF_LEN || len > MAX_EXTERNAL_REF_LEN {
             return Err(BillPaymentsError::InvalidExternalRef);
@@ -899,7 +954,7 @@ impl BillPayments {
             .unwrap_or_else(|| Map::new(&env));
 
         let mut bill = bills.get(bill_id).ok_or(BillPaymentsError::BillNotFound)?;
-        let bill_external_ref = bill.external_ref.clone();
+        let _bill_external_ref = bill.external_ref.clone();
 
         if bill.owner != caller {
             return Err(BillPaymentsError::Unauthorized);
@@ -1540,6 +1595,7 @@ impl BillPayments {
         let current_time = env.ledger().timestamp();
         let mut archived_count = 0u32;
         let mut to_remove: Vec<u32> = Vec::new(&env);
+        let mut owner_to_archived: Map<Address, Vec<u32>> = Map::new(&env);
 
         for (id, bill) in bills.iter() {
             if let Some(paid_at) = bill.paid_at {
@@ -1561,7 +1617,13 @@ impl BillPayments {
                         currency: bill.currency.clone(),
                     };
                     archived.set(id, archived_bill);
-                    Self::index_add_archived(&env, &bill.owner, id);
+
+                    let mut list = owner_to_archived
+                        .get(bill.owner.clone())
+                        .unwrap_or_else(|| Vec::new(&env));
+                    list.push_back(id);
+                    owner_to_archived.set(bill.owner.clone(), list);
+
                     to_remove.push_back(id);
                     archived_count += 1;
                 }
@@ -1579,13 +1641,10 @@ impl BillPayments {
             .instance()
             .set(&symbol_short!("ARCH_BILL"), &archived);
 
-        // Update owner indexes: move archived IDs from active → archived index.
-        // We iterate the archived map to find owner per ID.
-        for id in to_remove.iter() {
-            if let Some(bill) = archived.get(id) {
-                Self::index_remove_active(&env, &bill.owner, id);
-                Self::index_add_archived(&env, &bill.owner, id);
-            }
+        // Update owner indexes in batch per owner
+        for (owner, ids) in owner_to_archived.iter() {
+            Self::index_remove_active_batch(&env, &owner, &ids);
+            Self::index_add_archived_batch(&env, &owner, &ids);
         }
 
         Self::extend_archive_ttl(&env);
@@ -1687,27 +1746,37 @@ impl BillPayments {
             .unwrap_or_else(|| Map::new(&env));
         let mut deleted_count = 0u32;
         let mut to_remove: Vec<u32> = Vec::new(&env);
+        let mut owner_to_removed: Map<Address, Vec<u32>> = Map::new(&env);
 
         for (id, bill) in archived.iter() {
             if bill.archived_at < before_timestamp {
                 if let Some(ref r) = bill.external_ref {
                     Self::release_external_ref(&env, &bill.owner, r);
                 }
+                
+                let mut list = owner_to_removed
+                    .get(bill.owner.clone())
+                    .unwrap_or_else(|| Vec::new(&env));
+                list.push_back(id);
+                owner_to_removed.set(bill.owner.clone(), list);
+
                 to_remove.push_back(id);
                 deleted_count += 1;
             }
         }
 
         for id in to_remove.iter() {
-            if let Some(bill) = archived.get(id) {
-                Self::index_remove_archived(&env, &bill.owner, id);
-                archived.remove(id);
-            }
+            archived.remove(id);
         }
 
         env.storage()
             .instance()
             .set(&symbol_short!("ARCH_BILL"), &archived);
+
+        // Update owner indexes in batch per owner
+        for (owner, ids) in owner_to_removed.iter() {
+            Self::index_remove_archived_batch(&env, &owner, &ids);
+        }
         Self::update_storage_stats(&env);
 
         Ok(deleted_count)
@@ -2140,17 +2209,6 @@ impl BillPayments {
             .get(&ARCH_IDX_KEY)
             .unwrap_or_else(|| Map::new(env));
         idx.get(owner.clone()).unwrap_or_else(|| Vec::new(env))
-    }
-
-    /// Persist the owner's archived bill ID list back to ARCH_IDX.
-    fn set_owner_index(env: &Env, owner: &Address, ids: Vec<u32>) {
-        let mut idx: Map<Address, Vec<u32>> = env
-            .storage()
-            .instance()
-            .get(&ARCH_IDX_KEY)
-            .unwrap_or_else(|| Map::new(env));
-        idx.set(owner.clone(), ids);
-        env.storage().instance().set(&ARCH_IDX_KEY, &idx);
     }
 
     fn adjust_unpaid_total(env: &Env, owner: &Address, delta: i128) {
