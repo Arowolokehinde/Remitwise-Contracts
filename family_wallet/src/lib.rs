@@ -388,7 +388,7 @@ impl FamilyWallet {
             .unwrap_or_else(|| panic!("Wallet not initialized"));
 
         if members.get(member_address.clone()).is_some() {
-            return Err(Error::InvalidRole);
+            return Err(Error::MemberAlreadyExists);
         }
 
         Self::extend_instance_ttl(&env);
