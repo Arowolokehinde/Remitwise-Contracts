@@ -153,6 +153,31 @@ pub struct FinancialHealthReport {
     pub generated_at: u64,
 }
 
+/// Top-N bills by amount or due date
+#[contracttype]
+#[derive(Clone)]
+pub struct TopNBillsReport {
+    pub items: Vec<Bill>,
+    pub total_amount: i128,
+    pub total_count: u32,
+    pub period_start: u64,
+    pub period_end: u64,
+    pub data_availability: DataAvailability,
+}
+
+/// Top-N savings goals by target amount or progress
+#[contracttype]
+#[derive(Clone)]
+pub struct TopNSavingsReport {
+    pub items: Vec<SavingsGoal>,
+    pub total_target: i128,
+    pub total_saved: i128,
+    pub total_count: u32,
+    pub period_start: u64,
+    pub period_end: u64,
+    pub data_availability: DataAvailability,
+}
+
 /// Contract addresses configuration
 #[contracttype]
 #[derive(Clone)]
@@ -239,6 +264,7 @@ pub trait RemittanceSplitTrait {
 #[contractclient(name = "SavingsGoalsClient")]
 pub trait SavingsGoalsTrait {
     fn get_all_goals(env: Env, owner: Address) -> Vec<SavingsGoal>;
+    fn get_goals(env: Env, owner: Address, cursor: u32, limit: u32) -> GoalPage;
     fn is_goal_completed(env: Env, goal_id: u32) -> bool;
 }
 
@@ -272,6 +298,15 @@ pub struct SavingsGoal {
     pub target_date: u64,
     pub locked: bool,
     pub unlock_date: Option<u64>,
+    pub tags: Vec<soroban_sdk::String>,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct GoalPage {
+    pub items: Vec<SavingsGoal>,
+    pub next_cursor: u32,
+    pub count: u32,
 }
 
 #[contracttype]
@@ -326,21 +361,22 @@ pub struct PolicyPage {
 /// Compute `(numerator * scale) / denominator` using checked arithmetic.
 ///
 /// Returns `0` when `denominator <= 0` (safe default for percentage/ratio math).
-/// The result is clamped to `[0, scale]` so callers can rely on the output
-/// never exceeding the intended ceiling.
-///
-/// All intermediate arithmetic uses `i128` to avoid overflow on large inputs.
+/// Intermediate arithmetic uses `i128` to avoid overflow on large inputs.
 pub(crate) fn safe_percent(numerator: i128, denominator: i128, scale: i128) -> i128 {
     if denominator <= 0 {
         return 0;
     }
-    // checked_mul returns None on overflow; fall back to 0 (safe default).
-    let scaled = match numerator.checked_mul(scale) {
-        Some(v) => v,
-        None => return scale, // numerator >= denominator in overflow cases → clamp to scale
-    };
-    let result = scaled / denominator;
-    result.clamp(0, scale)
+    // checked_mul returns None on overflow
+    match numerator.checked_mul(scale) {
+        Some(scaled) => scaled / denominator,
+        None => {
+            if numerator > 0 {
+                scale
+            } else {
+                -scale
+            }
+        }
+    }
 }
 
 #[contract]
@@ -939,8 +975,7 @@ impl ReportingContract {
         let compliance_percentage = if total_bills == 0 {
             100
         } else {
-            safe_percent(paid_bills as i128, total_bills as i128, 100)
-                .min(100) as u32
+            safe_percent(paid_bills as i128, total_bills as i128, 100).clamp(0, 100) as u32
         };
 
         Ok(BillComplianceReport {
@@ -1017,8 +1052,8 @@ impl ReportingContract {
         }
 
         let annual_premium = monthly_premium.saturating_mul(12);
-        let coverage_to_premium_ratio = safe_percent(total_coverage, annual_premium, 100)
-            .clamp(0, u32::MAX as i128) as u32;
+        let coverage_to_premium_ratio =
+            safe_percent(total_coverage, annual_premium, 100).clamp(0, u32::MAX as i128) as u32;
 
         Ok(InsuranceReport {
             active_policies,
@@ -1059,8 +1094,8 @@ impl ReportingContract {
             total_saved = total_saved.saturating_add(goal.current_amount);
         }
         let savings_score = if total_target > 0 {
-            let progress = safe_percent(total_saved, total_target, 100).min(100);
-            (safe_percent(progress, 100, 40)).min(40) as u32
+            let progress = safe_percent(total_saved, total_target, 100).clamp(0, 100);
+            (safe_percent(progress, 100, 40)).clamp(0, 40) as u32
         } else {
             20 // Default score if no goals
         };
@@ -1139,6 +1174,176 @@ impl ReportingContract {
             insurance_report,
             generated_at,
         })
+    }
+
+    /// Top-N bills sorted by amount (descending) within the period.
+    pub fn get_top_bills_report(
+        env: Env,
+        user: Address,
+        period_start: u64,
+        period_end: u64,
+    ) -> Result<TopNBillsReport, ReportingError> {
+        Self::validate_period(period_start, period_end)?;
+        user.require_auth();
+        Ok(Self::get_top_bills_report_internal(
+            &env,
+            user,
+            period_start,
+            period_end,
+        ))
+    }
+
+    fn get_top_bills_report_internal(
+        env: &Env,
+        user: Address,
+        period_start: u64,
+        period_end: u64,
+    ) -> TopNBillsReport {
+        let addresses: ContractAddresses = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("ADDRS"))
+            .unwrap_or_else(|| panic!("Contract addresses not configured"));
+
+        let bill_client = BillPaymentsClient::new(env, &addresses.bill_payments);
+
+        let mut total_amount = 0i128;
+        let mut total_count = 0u32;
+        let mut availability = DataAvailability::Complete;
+        let mut top_bills: Vec<Bill> = Vec::new(env);
+
+        let mut cursor = 0u32;
+        let mut pages_fetched = 0u32;
+        loop {
+            let page = bill_client.get_all_bills_for_owner(&user, &cursor, &50u32);
+            for bill in page.items.iter() {
+                if bill.created_at < period_start || bill.created_at > period_end {
+                    continue;
+                }
+                total_amount += bill.amount;
+                total_count += 1;
+
+                // Sorted insertion for Top-N
+                let mut inserted = false;
+                for i in 0..top_bills.len() {
+                    if bill.amount > top_bills.get(i).unwrap().amount {
+                        top_bills.insert(i, bill.clone());
+                        inserted = true;
+                        break;
+                    }
+                }
+                if !inserted && top_bills.len() < MAX_ITEMS_PER_REPORT {
+                    top_bills.push_back(bill);
+                } else if top_bills.len() > MAX_ITEMS_PER_REPORT {
+                    top_bills.remove(MAX_ITEMS_PER_REPORT);
+                    availability = DataAvailability::Partial;
+                }
+            }
+            pages_fetched += 1;
+            if page.next_cursor == 0 {
+                break;
+            }
+            if pages_fetched >= MAX_DEP_PAGES {
+                availability = DataAvailability::Partial;
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+
+        TopNBillsReport {
+            items: top_bills,
+            total_amount,
+            total_count,
+            period_start,
+            period_end,
+            data_availability: availability,
+        }
+    }
+
+    /// Top-N savings goals sorted by target amount (descending).
+    pub fn get_top_savings_report(
+        env: Env,
+        user: Address,
+        period_start: u64,
+        period_end: u64,
+    ) -> Result<TopNSavingsReport, ReportingError> {
+        Self::validate_period(period_start, period_end)?;
+        user.require_auth();
+        Ok(Self::get_top_savings_report_internal(
+            &env,
+            user,
+            period_start,
+            period_end,
+        ))
+    }
+
+    fn get_top_savings_report_internal(
+        env: &Env,
+        user: Address,
+        period_start: u64,
+        period_end: u64,
+    ) -> TopNSavingsReport {
+        let addresses: ContractAddresses = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("ADDRS"))
+            .unwrap_or_else(|| panic!("Contract addresses not configured"));
+
+        let savings_client = SavingsGoalsClient::new(env, &addresses.savings_goals);
+
+        let mut total_target = 0i128;
+        let mut total_saved = 0i128;
+        let mut total_count = 0u32;
+        let mut availability = DataAvailability::Complete;
+        let mut top_goals: Vec<SavingsGoal> = Vec::new(env);
+
+        let mut cursor = 0u32;
+        let mut pages_fetched = 0u32;
+        loop {
+            let page = savings_client.get_goals(&user, &cursor, &50u32);
+            for goal in page.items.iter() {
+                // Goals don't have created_at in the struct, using target_date for period filtering if appropriate
+                // But typically goals are active across periods. For now, we take all active goals.
+                total_target += goal.target_amount;
+                total_saved += goal.current_amount;
+                total_count += 1;
+
+                // Sorted insertion for Top-N
+                let mut inserted = false;
+                for i in 0..top_goals.len() {
+                    if goal.target_amount > top_goals.get(i).unwrap().target_amount {
+                        top_goals.insert(i, goal.clone());
+                        inserted = true;
+                        break;
+                    }
+                }
+                if !inserted && top_goals.len() < MAX_ITEMS_PER_REPORT {
+                    top_goals.push_back(goal);
+                } else if top_goals.len() > MAX_ITEMS_PER_REPORT {
+                    top_goals.remove(MAX_ITEMS_PER_REPORT);
+                    availability = DataAvailability::Partial;
+                }
+            }
+            pages_fetched += 1;
+            if page.next_cursor == 0 {
+                break;
+            }
+            if pages_fetched >= MAX_DEP_PAGES {
+                availability = DataAvailability::Partial;
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+
+        TopNSavingsReport {
+            items: top_goals,
+            total_target,
+            total_saved,
+            total_count,
+            period_start,
+            period_end,
+            data_availability: availability,
+        }
     }
 
     /// Generate trend analysis comparing two data points.

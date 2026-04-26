@@ -47,7 +47,7 @@ mod remittance_split {
 }
 
 mod savings_goals {
-    use crate::{SavingsGoal, SavingsGoalsTrait};
+    use crate::{GoalPage, SavingsGoal, SavingsGoalsTrait};
     use soroban_sdk::{contract, contractimpl, Address, Env, String as SorobanString, Vec};
 
     #[contract]
@@ -67,6 +67,7 @@ mod savings_goals {
                 target_date: 1735689600,
                 locked: true,
                 unlock_date: None,
+                tags: Vec::new(&env),
             });
             goals.push_back(SavingsGoal {
                 id: 2,
@@ -77,8 +78,18 @@ mod savings_goals {
                 target_date: 1735689600,
                 locked: true,
                 unlock_date: None,
+                tags: Vec::new(&env),
             });
             goals
+        }
+
+        fn get_goals(env: Env, owner: Address, _cursor: u32, _limit: u32) -> GoalPage {
+            let items = Self::get_all_goals(env, owner);
+            GoalPage {
+                count: items.len(),
+                items,
+                next_cursor: 0,
+            }
         }
 
         fn is_goal_completed(_env: Env, goal_id: u32) -> bool {
@@ -114,8 +125,6 @@ mod bill_payments {
                 schedule_id: None,
                 tags: Vec::new(&env),
                 currency: SorobanString::from_str(&env, "XLM"),
-                external_ref: None,
-                tags: Vec::new(&env),
             });
             BillPage {
                 count: bills.len(),
@@ -151,8 +160,6 @@ mod bill_payments {
                 schedule_id: None,
                 tags: Vec::new(&env),
                 currency: SorobanString::from_str(&env, "XLM"),
-                external_ref: None,
-                tags: Vec::new(&env),
             });
             bills.push_back(Bill {
                 id: 2,
@@ -169,8 +176,6 @@ mod bill_payments {
                 schedule_id: None,
                 tags: Vec::new(&env),
                 currency: SorobanString::from_str(&env, "XLM"),
-                external_ref: None,
-                tags: Vec::new(&env),
             });
             BillPage {
                 count: bills.len(),
@@ -452,7 +457,7 @@ fn test_verify_dependency_address_set_rejects_self_reference() {
     client.init(&admin);
 
     let addrs = ContractAddresses {
-        remittance_split: Address::generate(&env),
+        remittance_split: contract_id.clone(),
         savings_goals: Address::generate(&env),
         bill_payments: Address::generate(&env),
         insurance: Address::generate(&env),
@@ -2273,4 +2278,53 @@ fn test_insurance_paging_cursor_monotonicity() {
         "cursor must advance monotonically so each page is visited exactly once"
     );
     assert_eq!(report.data_availability, DataAvailability::Complete);
+}
+
+#[test]
+fn test_top_n_reports() {
+    let env = create_test_env();
+    set_ledger_time(&env, 1, 1704067200);
+    let contract_id = env.register_contract(None, ReportingContract);
+    let client = ReportingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    client.init(&admin);
+
+    let remittance_split_id = env.register_contract(None, remittance_split::RemittanceSplit);
+    let savings_goals_id = env.register_contract(None, savings_goals::SavingsGoalsContract);
+    let bill_payments_id = env.register_contract(None, bill_payments::BillPayments);
+    let insurance_id = env.register_contract(None, insurance::Insurance);
+    let family_wallet = Address::generate(&env);
+
+    client.configure_addresses(
+        &admin,
+        &remittance_split_id,
+        &savings_goals_id,
+        &bill_payments_id,
+        &insurance_id,
+        &family_wallet,
+    );
+
+    let period_start = 1704067200u64;
+    let period_end = 1706745600u64;
+
+    // Test Top-N Bills
+    let bill_report = client.get_top_bills_report(&user, &period_start, &period_end);
+    // BillPayments mock returns 2 bills in get_all_bills_for_owner: id 1 (100) and id 2 (50)
+    assert_eq!(bill_report.total_count, 2);
+    assert_eq!(bill_report.total_amount, 150);
+    assert_eq!(bill_report.items.len(), 2);
+    assert_eq!(bill_report.items.get(0).unwrap().amount, 100);
+    assert_eq!(bill_report.items.get(1).unwrap().amount, 50);
+
+    // Test Top-N Savings
+    let savings_report = client.get_top_savings_report(&user, &period_start, &period_end);
+    // SavingsGoals mock returns 2 goals: Education (target 10000) and Emergency (target 5000)
+    assert_eq!(savings_report.total_count, 2);
+    assert_eq!(savings_report.total_target, 15000);
+    assert_eq!(savings_report.total_saved, 12000);
+    assert_eq!(savings_report.items.len(), 2);
+    assert_eq!(savings_report.items.get(0).unwrap().target_amount, 10000);
+    assert_eq!(savings_report.items.get(1).unwrap().target_amount, 5000);
 }
